@@ -1,0 +1,708 @@
+# Cython compiler directives.
+# distutils: language=c++
+
+
+import warnings
+import numpy as np
+
+from . import constants
+
+cimport cython
+from libc.math cimport sqrt, sin, INFINITY
+from libcpp.vector cimport vector as cpp_vector
+from libc.stdlib   cimport malloc, free
+
+cimport numpy as np
+
+from . cimport constants
+from . cimport fields
+from . cimport heapq
+
+
+cdef class EikonalSolver(object):
+    """
+    The core class of PyKonal for solving the Eikonal equation.
+
+    .. code-block:: python
+
+       import numpy as np
+       import pykonal
+
+       # Instantiate EikonalSolver object.
+       solver = pykonal.solver.EikonalSolver(coord_sys="cartesian")
+       # Initialize EikonalSolver object's velocity attribute.
+       solver.velocity.min_coords = 0, 0, 0
+       solver.velocity.node_intervals = 1, 1, 1
+       solver.velocity.npts = 16, 16, 16
+       solver.velocity.values = np.ones(solver.velocity.npts)
+       # Initialize the traveltime field with a source at node with
+       # index (0, 0, 0).
+       src_idx = (0, 0, 0)
+       # Remove source node from *Unknown*
+       solver.unknown[src_idx] = False
+       # Add source node to *Trial*.
+       solver.trial.push(*src_idx)
+       # Solve the system.
+       solver.solve()
+       # Extract the traveltime values.
+       tt = solver.traveltime.values
+    """
+
+    def __init__(self, coord_sys="cartesian"):
+        self.cy_coord_sys = coord_sys
+        self.cy_velocity = fields.ScalarField3D(coord_sys=self.coord_sys)
+
+    @property
+    def trial(self):
+        """
+        [*Read/Write*, :class:`pykonal.heapq.Heap`] Heap of node
+        indices in *Trial*.
+        """
+        if self.cy_trial is None:
+            self.cy_trial = heapq.Heap(self.traveltime.values)
+        return self.cy_trial
+
+    @property
+    def coord_sys(self):
+        """
+        [*Read only*, str] Coordinate system of solver
+        {"Cartesian", "spherical"}.
+        """
+        return self.cy_coord_sys
+
+    @property
+    def known(self):
+        """
+        [*Read/Write*, numpy.ndarray(shape=(N0,N1,N2), dtype=numpy.bool)] 3D array of booleans
+        indicating whether nodes are in *Known*.
+        """
+        try:
+            return (np.asarray(self.cy_known))
+        except AttributeError:
+            self.cy_known = np.zeros(self.tt.npts, dtype=constants.DTYPE_BOOL)
+        return np.asarray(self.cy_known)
+
+    @property
+    def unknown(self):
+        """
+        [*Read/Write*, numpy.ndarray(shape=(N0,N1,N2), dtype=numpy.bool)] 3D array of booleans
+        indicating whether nodes are in *Unknown*.
+        """
+        try:
+            return (np.asarray(self.cy_unknown))
+        except AttributeError:
+            self.cy_unknown = np.ones(self.tt.npts, dtype=constants.DTYPE_BOOL)
+        return np.asarray(self.cy_unknown)
+
+    @property
+    def traveltime(self):
+        """
+        [*Read/Write*, :class:`pykonal.fields.ScalarField3D`] 3D array
+        of traveltime values.
+        """
+        if self.cy_traveltime is None:
+            self.cy_traveltime = fields.ScalarField3D(coord_sys=self.coord_sys)
+            self.cy_traveltime.min_coords = self.velocity.min_coords
+            self.cy_traveltime.node_intervals = self.velocity.node_intervals
+            self.cy_traveltime.npts = self.velocity.npts
+            self.cy_traveltime.values = np.full_like(self.velocity.values, fill_value=np.inf)
+        return self.cy_traveltime
+
+    @property
+    def tt(self):
+        """
+        [*Read/Write*, :class:`pykonal.fields.ScalarField3D`] Alias for
+        self.traveltime.
+        """
+        return self.traveltime
+
+    @property
+    def velocity(self):
+        """
+        [*Read/Write*, :class:`pykonal.fields.ScalarField3D`] 3D array
+        of velocity values.
+        """
+        return self.cy_velocity
+
+    @property
+    def vv(self):
+        """
+        [*Read/Write*, :class:`pykonal.fields.ScalarField3D`] Alias for
+        self.velocity.
+        """
+        return self.velocity
+
+
+    def _shape_of(self, arr):
+        return tuple(np.asarray(arr).shape)
+
+    def _npts_of(self, field):
+        return tuple(np.asarray(field.npts).astype(int).tolist())
+
+    cpdef constants.BOOL_t _check_state(EikonalSolver self):
+        """
+        Verify the lazily-built FMM state is consistent with the grid, and
+        re-point the trial heap at the live traveltime array.
+
+        Under MPI a mis-ordered setup does not fail loudly & each rank
+        quietly solves a different problem, so this is checked on every
+        solve()
+        """
+        npts = self._npts_of(self.velocity)
+
+        if self._npts_of(self.traveltime) != npts:
+            raise ValueError(
+                "traveltime grid %s does not match velocity grid %s. The "
+                "traveltime field is built the first time it is accessed; "
+                "finish configuring velocity before touching traveltime, "
+                "tt, known, unknown or trial."
+                % (self._npts_of(self.traveltime), npts)
+            )
+        if self._shape_of(self.velocity.values) != npts:
+            raise ValueError("shape_of(velocity.values) != npts")
+        if self._shape_of(self.known) != npts:
+            raise ValueError("shape_of(known) != npts")
+        if self._shape_of(self.unknown) != npts:
+            raise ValueError("shape_of(unknown) != npts")
+
+        if not np.shares_memory(self.trial.values, self.traveltime.values):
+            self.trial.rebind(self.traveltime.values)
+
+        return True
+
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
+    @cython.initializedcheck(False)
+    cpdef constants.BOOL_t solve(EikonalSolver self, constants.REAL_t max_traveltime=np.inf):
+        """
+        solve(self,max_traveltime)
+
+        Solve the Eikonal equation using the FMM.
+        :new arg "max_traveltime" which limits the range of tracing
+                 this is primarily for PyVoroTomo to save processing for sparse models
+        :return: Returns True upon successful execution.
+        :rtype:  bool
+        """
+        cdef Py_ssize_t                           i, iax, jax, idrxn, iheap
+        cdef Py_ssize_t                           nbr1_i1, nbr1_i2, nbr1_i3
+        cdef Py_ssize_t                           nbr2_i1, nbr2_i2, nbr2_i3
+        cdef Py_ssize_t[6][3]                     nbrs
+        cdef Py_ssize_t[3]                        nbr, switch, max_idx, active_idx
+        cdef Py_ssize_t[2]                        drxns = [-1, 1]
+        cdef Py_ssize_t[:,:,:]                    heap_index
+        cdef (Py_ssize_t, Py_ssize_t, Py_ssize_t) idx
+        cdef int                                  inbr
+        cdef int[2]                               order
+        cdef constants.REAL_t                     a, b, c, bfd, ffd, new
+        cdef constants.REAL_t[2]                  fdu
+        cdef constants.REAL_t[3]                  aa, bb, cc, op_tt
+        cdef Py_ssize_t                           drop_iax
+        cdef constants.REAL_t                     max_op
+        cdef constants.REAL_t[:,:,:]              tt, vv
+        cdef constants.REAL_t[:,:,:]              norm
+        cdef constants.BOOL_t[3]                  iax_isperiodic
+        cdef constants.BOOL_t[:,:,:]              known, unknown
+        cdef heapq.Heap                           trial
+        cdef constants.REAL_t                     max_traveltime_c = max_traveltime
+        cdef constants.REAL_t                     norm_iax, norm_iax_sq, denom_iax
+        cdef constants.REAL_t                     tt_nbr, v_nbr, tt1, tt2
+
+        for iax in range(3):
+            max_idx[iax] = <Py_ssize_t> self.cy_traveltime.cy_npts[iax]
+            iax_isperiodic[iax] = <constants.BOOL_t> self.cy_traveltime.cy_iax_isperiodic[iax]
+
+        self._check_state()
+        tt = self.traveltime.values
+        vv = self.velocity.values
+        norm = self.cy_velocity._norm_compact()
+        known = self.known
+        unknown = self.unknown
+        trial = self.trial
+        heap_index = trial.cy_heap_index
+
+        while trial.cy_keys.size() > 0:
+            # Let Active be the point in Trial with the smallest traveltime value
+            idx = trial.pop()
+
+            # Early exit once wavefront exceeds the limit
+            if tt[idx[0], idx[1], idx[2]] > max_traveltime_c:
+                break
+
+            active_idx = [idx[0], idx[1], idx[2]]
+            known[active_idx[0], active_idx[1], active_idx[2]] = True
+
+            # Determine the indices of neighbouring nodes
+            inbr = 0
+            for iax in range(3):
+                switch = [0, 0, 0]
+                for idrxn in range(2):
+                    switch[iax] = drxns[idrxn]
+                    for jax in range(3):
+                        if iax_isperiodic[jax]:
+                            nbrs[inbr][jax] = (
+                                  active_idx[jax]
+                                + switch[jax]
+                                + max_idx[jax]
+                            ) % max_idx[jax]
+                        else:
+                            nbrs[inbr][jax] = active_idx[jax] + switch[jax]
+                    inbr += 1
+
+            # Recompute the traveltime values at all Trial neighbours of Active by solving the piecewise quadratic eq
+            for i in range(6):
+                nbr    = nbrs[i]
+                if not stencil(nbr[0], nbr[1], nbr[2], max_idx[0], max_idx[1], max_idx[2]) or known[nbr[0], nbr[1], nbr[2]]:
+                    continue
+                v_nbr  = vv[nbr[0], nbr[1], nbr[2]]
+                tt_nbr = tt[nbr[0], nbr[1], nbr[2]]
+                if v_nbr > 0:
+                    for iax in range(3):
+
+                        norm_iax = norm[nbr[0], nbr[1], iax]
+                        if norm_iax == 0:
+                            aa[iax], bb[iax], cc[iax] = 0, 0, 0
+                            op_tt[iax] = -1.0  # axis inactive
+                            continue
+                        switch = [0, 0, 0]
+                        idrxn = 0
+                        norm_iax_sq = norm_iax * norm_iax
+                        denom_iax = 4.0 * norm_iax_sq
+
+                        for idrxn in range(2):
+                            switch[iax] = drxns[idrxn]
+                            nbr1_i1 = (nbr[0]+switch[0]+max_idx[0]) % max_idx[0]\
+                                if iax_isperiodic[0] else nbr[0]+switch[0]
+                            nbr1_i2 = (nbr[1]+switch[1]+max_idx[1]) % max_idx[1]\
+                                if iax_isperiodic[1] else nbr[1]+switch[1]
+                            nbr1_i3 = (nbr[2]+switch[2]+max_idx[2]) % max_idx[2]\
+                                if iax_isperiodic[2] else nbr[2]+switch[2]
+                            nbr2_i1 = (nbr[0]+2*switch[0]+max_idx[0]) % max_idx[0]\
+                                if iax_isperiodic[0] else nbr[0]+2*switch[0]
+                            nbr2_i2 = (nbr[1]+2*switch[1]+max_idx[1]) % max_idx[1]\
+                                if iax_isperiodic[1] else nbr[1]+2*switch[1]
+                            nbr2_i3 = (nbr[2]+2*switch[2]+max_idx[2]) % max_idx[2]\
+                                if iax_isperiodic[2] else nbr[2]+2*switch[2]
+                            if (
+                                (
+                                   drxns[idrxn] == -1
+                                   and (nbr[iax] > 1 or iax_isperiodic[iax])
+                                )
+                                or
+                                (
+                                    drxns[idrxn] == 1
+                                    and (nbr[iax] < max_idx[iax] - 2 or iax_isperiodic[iax])
+                                )
+                            )\
+                                and known[nbr2_i1, nbr2_i2, nbr2_i3]\
+                                and known[nbr1_i1, nbr1_i2, nbr1_i3]\
+                                and tt[nbr2_i1, nbr2_i2, nbr2_i3] \
+                                    <= tt[nbr1_i1, nbr1_i2, nbr1_i3]\
+                            :
+                                order[idrxn] = 2
+                                tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                                tt2 = tt[nbr2_i1, nbr2_i2, nbr2_i3]
+                                fdu[idrxn]  = drxns[idrxn] * (
+                                    -3.0 * tt_nbr + 4.0 * tt1 - tt2
+                                ) / (2.0 * norm_iax)
+                            elif (
+                                (
+                                    drxns[idrxn] == -1
+                                    and (nbr[iax] > 0 or iax_isperiodic[iax])
+                                )
+                                or (
+                                    drxns[idrxn] ==  1
+                                    and (nbr[iax] < max_idx[iax] - 1 or iax_isperiodic[iax])
+                                )
+                            )\
+                                and known[nbr1_i1, nbr1_i2, nbr1_i3]\
+                            :
+                                order[idrxn] = 1
+                                tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                                fdu[idrxn] = drxns[idrxn] * (tt1 - tt_nbr) / norm_iax
+                            else:
+                                order[idrxn], fdu[idrxn] = 0, 0
+                        if fdu[0] > -fdu[1]:
+                            # Do the update using the backward operator
+                            idrxn, switch[iax] = 0, -1
+                        else:
+                            # Do the update using the forward operator
+                            idrxn, switch[iax] = 1, 1
+                        nbr1_i1 = (nbr[0]+switch[0]+max_idx[0]) % max_idx[0]\
+                            if iax_isperiodic[0] else nbr[0]+switch[0]
+                        nbr1_i2 = (nbr[1]+switch[1]+max_idx[1]) % max_idx[1]\
+                            if iax_isperiodic[1] else nbr[1]+switch[1]
+                        nbr1_i3 = (nbr[2]+switch[2]+max_idx[2]) % max_idx[2]\
+                            if iax_isperiodic[2] else nbr[2]+switch[2]
+                        nbr2_i1 = (nbr[0]+2*switch[0]+max_idx[0]) % max_idx[0]\
+                            if iax_isperiodic[0] else nbr[0]+2*switch[0]
+                        nbr2_i2 = (nbr[1]+2*switch[1]+max_idx[1]) % max_idx[1]\
+                            if iax_isperiodic[1] else nbr[1]+2*switch[1]
+                        nbr2_i3 = (nbr[2]+2*switch[2]+max_idx[2]) % max_idx[2]\
+                            if iax_isperiodic[2] else nbr[2]+2*switch[2]
+                        if order[idrxn] == 2:
+                            tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                            tt2 = tt[nbr2_i1, nbr2_i2, nbr2_i3]
+                            aa[iax] = 9.0 / denom_iax
+                            bb[iax] = (6.0 * tt2 - 24.0 * tt1) / denom_iax
+                            cc[iax] = (tt2*tt2 - 8.0*tt2*tt1 + 16.0*tt1*tt1) / denom_iax
+                            op_tt[iax] = tt1
+                        elif order[idrxn] == 1:
+                            tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                            aa[iax] = 1.0 / norm_iax_sq
+                            bb[iax] = -2.0 * tt1 / norm_iax_sq
+                            cc[iax] = tt1 * tt1 / norm_iax_sq
+                            op_tt[iax] = tt1
+                        elif order[idrxn] == 0:
+                            aa[iax], bb[iax], cc[iax] = 0, 0, 0
+                            op_tt[iax] = -1.0  # axis inactive
+                    # Solve the multi-axis quadratic with the standard
+                    # dimension-reduction repair: a negative discriminant,
+                    # or a root smaller than an operand traveltime, means
+                    # the characteristic cannot pass through the quadrant
+                    # spanned by the active axes (this happens most often
+                    # with large node-interval ratios between axes, e.g.
+                    # near the poles of the near-field spherical grid).
+                    # Instead of zeroing the discriminant, drop the axis
+                    # with the largest operand traveltime and re-solve
+                    # with the remaining axes.
+                    new = INFINITY
+                    while True:
+                        a = aa[0] + aa[1] + aa[2]
+                        if a < 1e-20:
+                            break
+                        b = bb[0] + bb[1] + bb[2]
+                        c = cc[0] + cc[1] + cc[2] - 1.0/(v_nbr*v_nbr)
+                        if b*b >= 4*a*c:
+                            new = (-b + sqrt(b*b - 4*a*c)) / (2*a)
+                            # Causality check: the root must not undercut
+                            # any operand traveltime still in the update.
+                            if (
+                                    new >= op_tt[0]
+                                and new >= op_tt[1]
+                                and new >= op_tt[2]
+                            ):
+                                break
+                            new = INFINITY
+                        # Drop the active axis with the largest operand.
+                        drop_iax, max_op = 0, -1.0
+                        for iax in range(3):
+                            if op_tt[iax] > max_op:
+                                drop_iax, max_op = iax, op_tt[iax]
+                        if max_op < 0:
+                            break
+                        aa[drop_iax] = 0
+                        bb[drop_iax] = 0
+                        cc[drop_iax] = 0
+                        op_tt[drop_iax] = -1.0
+                    if new == INFINITY:
+                        continue
+                    if new < tt_nbr:
+                        tt[nbr[0], nbr[1], nbr[2]] = new
+                        # Tag as Trial all neighbours of Active that are not
+                        # Alive. If the neighbour is in Far, remove it from
+                        # that list and add it to Trial.
+                        if unknown[nbr[0], nbr[1], nbr[2]]:
+                            trial.push(nbr[0], nbr[1], nbr[2])
+                            unknown[nbr[0], nbr[1], nbr[2]] = False
+                        else:
+                            trial.sift_down(0, heap_index[nbr[0], nbr[1], nbr[2]])
+        return True
+
+
+    cpdef np.ndarray[constants.REAL_t, ndim=2] trace_ray(
+            EikonalSolver self,
+            constants.REAL_t[:] end):
+        """
+        trace_ray(self, end)
+
+        An alias to self.traveltime.trace_ray().
+        """
+        return self.traveltime.trace_ray(end)
+
+
+class PointSourceSolver(EikonalSolver):
+    """
+    A convenience class to improve precision when solving the common
+    problem of a point source.
+
+    This class implements a pair of complementary computational grids
+    to improve precision. A refined spherical grid centered on the
+    source is used in the near-source region. The user can specify
+    whether a Cartesian or spherical grid is used in the far field.
+    The refinement of the near-field grid will be handled automatically
+    using some reasonable values if the user does not manually configure
+    it.
+    """
+    def __init__(self, coord_sys="cartesian"):
+        super(PointSourceSolver, self).__init__(coord_sys=coord_sys)
+
+    @property
+    def dphi(self):
+        """
+        [*Read/Write*, float] Node interval (in radians) along the
+        azimuthal axis of the refined near-field grid.
+        """
+        if not hasattr(self, "_dphi"):
+            self._dphi = (2 * np.pi) / self.nphi
+        return self._dphi
+
+    @dphi.setter
+    def dphi(self, value):
+        self._dphi = value
+
+    @property
+    def drho(self):
+        """
+        [*Read/Write*, float] Node interval (in arbitrary distance units)
+        along the radial axis of the refined near-field grid.
+        """
+        if not hasattr(self, "_drho"):
+            if self.coord_sys == "cartesian":
+                self._drho = self.vv.node_intervals.min() / 8
+            else:
+                self._drho = self.vv.node_intervals[0] / 8
+        return self._drho
+
+    @drho.setter
+    def drho(self, value):
+        self._drho = value
+
+    @property
+    def dtheta(self):
+        """
+        [*Read/Write*, float] Node interval (in radians) along the
+        polar axis of the refined near-field grid.
+        """
+        if not hasattr(self, "_dtheta"):
+            self._dtheta = np.pi / (self.ntheta - 1)
+        return self._dtheta
+
+    @dtheta.setter
+    def dtheta(self, value):
+        self._dtheta = value
+
+    @property
+    def nphi(self):
+        """
+        [*Read*, int] Number of grid nodes along the azimuthal axis
+        of the refined near-field grid.
+        """
+        if not hasattr(self, "_nphi"):
+            self._nphi = 64
+        return self._nphi
+
+    @property
+    def nrho(self):
+        """
+        [*Read/Write*, int] Number of grid nodes along the radial axis
+        of the refined near-field grid.
+        """
+        if not hasattr(self, "_nrho"):
+            self._nrho = 64
+        return self._nrho
+
+    @nrho.setter
+    def nrho(self, value):
+        self._nrho = value
+
+    @property
+    def ntheta(self):
+        """
+        [*Read*, int] Number of grid nodes along the polar axis
+        of the refined near-field grid.
+        """
+        if not hasattr(self, "_ntheta"):
+            self._ntheta = 33
+        return self._ntheta
+
+    @property
+    def near_field(self):
+        """
+        [*Read/Write*, :class:`EikonalSolver`] Solver for the Eikonal
+        equation in the near-field region.
+        """
+        if not hasattr(self, "_near_field"):
+            self._near_field = EikonalSolver(coord_sys="spherical")
+        return self._near_field
+
+    @property
+    def src_loc(self):
+        """
+        [*Read/Write*, (float, float, float)] Location of the point
+        source in the coordinates of the far-field grid.
+        """
+        return self._src_loc
+
+    @src_loc.setter
+    def src_loc(self, value):
+        self._src_loc = value
+
+    def initialize_near_field_grid(self) -> bool:
+        """
+        Initialize the near-field grid.
+
+        :return: Returns True upon successful completion.
+        :rtype: bool
+        """
+        # TODO:: rho0 should be be the smallest non-zero value between
+        # The distance to the closest node and drho.
+        self.near_field.vv.min_coords = self.drho, 0, 0
+        self.near_field.vv.node_intervals = self.drho, self.dtheta, self.dphi
+        self.near_field.vv.npts = self.nrho, self.ntheta, self.nphi
+        return True
+
+    def initialize_near_field_narrow_band(self) -> bool:
+        """
+        Initialize the narrow band of the near-field grid using the
+        layer of nodes closest to the source.
+
+        :return: Returns True upon successful completion.
+        :rtype: bool
+        """
+        fallback_vv = None
+        fallback_computed = False
+
+        for it in range(self.ntheta):
+            for ip in range(self.nphi):
+                idx = (0, it, ip)
+                vv = self.near_field.vv.values[idx]
+                if np.isnan(vv):
+                    # a scheme to eliminate NaNs appearing.. set to the minimum but only compute once
+                    if not fallback_computed:
+                        valid_vv = self.near_field.vv.values[~np.isnan(self.near_field.vv.values)]
+                        fallback_vv = np.min(valid_vv) if len(valid_vv) > 0 else None
+                        fallback_computed = True
+                    if fallback_vv is None:
+                        continue
+                    vv = fallback_vv
+                self.near_field.tt.values[idx] = self.drho / vv
+                self.near_field.unknown[idx] = False
+                self.near_field.trial.push(*idx)
+        return True
+
+    def initialize_far_field_narrow_band(self) -> bool:
+        """
+        Initialize the narrow band of the far-field grid using all the
+        nodes with finite traveltimes.
+
+        :return: Returns True upon successful completion.
+        :rtype: bool
+        """
+        # Update the FMM state variables.
+        for idx in np.argwhere(~np.isinf(self.tt.values)):
+            idx = tuple(idx)
+            self.unknown[idx] = False
+            self.trial.push(*idx)
+        return True
+
+    def interpolate_near_field_traveltime_onto_far_field(self) -> bool:
+        """
+        Interpolate the near-field traveltime values onto the far-field
+        grid.
+
+        :return: Returns True upon successful completion.
+        :rtype: bool
+        """
+        # Transform the coordinates of the far-field grid nodes to the
+        # near-field coordinate system.
+        nodes = self.vv.transform_coordinates("spherical", self.src_loc)
+        # Find the indices of the far-field grid nodes that are inside
+        # the near-field grid.
+        bool_idx = True
+        for iax in range(3):
+            bool_idx = bool_idx &(
+                 (self.near_field.vv.iax_isnull[iax])
+                |(self.near_field.vv.iax_isperiodic[iax])
+                |(
+                     (nodes[...,iax] >= self.near_field.vv.min_coords[iax])
+                    &(nodes[...,iax] <= self.near_field.vv.max_coords[iax])
+                )
+            )
+        idxs = np.nonzero(bool_idx)
+        # Sample the near-field taveltime field on the far-field nodes.
+        # Make sure to filter out any NaN values.
+        tt = self.near_field.tt.resample(nodes[idxs].reshape(-1, 3))
+        idxs = np.swapaxes(np.stack(idxs), 0, 1)[~np.isnan(tt)]
+        self.tt.values[(idxs[:,0], idxs[:,1], idxs[:,2])] = tt[~np.isnan(tt)]
+        return True
+
+    def interpolate_far_field_velocity_onto_near_field(self) -> bool:
+        """
+        Interpolate the far-field velocity model onto the near-field
+        grid.
+
+        :return: Returns True upon successful completion.
+        :rtype: bool
+        """
+        # Compute the coordinates of the origin of the far-field grid
+        # with respect to the near-field coordinate system.
+        if self.coord_sys == "cartesian":
+            r0 = np.sqrt(np.sum(np.square(self.src_loc)))
+            t0 = np.pi - np.arccos(self.src_loc[2]/ r0)
+            p0 = (np.arctan2(self.src_loc[1], self.src_loc[0]) + np.pi) % (2 * np.pi)
+        else:
+            r0 = self.src_loc[0]
+            t0 = np.pi - self.src_loc[1]
+            p0 = (self.src_loc[2] + np.pi) % (2 * np.pi)
+        origin = (r0, t0, p0)
+        # Transform the coordinates of the near-field grid nodes to the
+        # far-field coordinate system.
+        nodes = self.near_field.vv.transform_coordinates(
+            self.coord_sys,
+            origin
+        )
+        # Find the indices of the near-field grid nodes that are inside
+        # the far-field grid.
+        bool_idx = True
+        for iax in range(3):
+            bool_idx = bool_idx &(
+                 (self.vv.iax_isnull[iax])
+                |(self.vv.iax_isperiodic[iax])
+                |(
+                     (nodes[...,iax] >= self.vv.min_coords[iax])
+                    &(nodes[...,iax] <= self.vv.max_coords[iax])
+                )
+            )
+        idxs = np.nonzero(bool_idx)
+        # Sample the far-field velocity model on the near-field nodes.
+        self.near_field.vv.values[idxs] = self.vv.resample(nodes[idxs].reshape(-1, 3))
+        return True
+
+    def solve(self, max_traveltime=np.inf):
+        """
+        Solve the Eikonal equation on the far-field grid using the
+        refined source grid in the near-field region.
+
+        :return: Returns True upon successful completion.
+        :rtype: bool
+        """
+        # Initialize the near-field grid.
+        self.initialize_near_field_grid()
+        # Interpolate far-field velocity model onto near-field nodes.
+        self.interpolate_far_field_velocity_onto_near_field()
+        # Initialize the narrow band of the near-field grid.
+        self.initialize_near_field_narrow_band()
+        # Propagate the wavefront through the near field.
+        self.near_field.solve()
+        # Interpolate the near-field traveltime values onto the far-field grid.
+        self.interpolate_near_field_traveltime_onto_far_field()
+        # Initialize the narrow band of the far-field grid.
+        self.initialize_far_field_narrow_band()
+        # Propagate the wavefront through the far field.
+        super(PointSourceSolver, self).solve(max_traveltime=max_traveltime)
+        return True
+
+
+cdef inline bint stencil(
+        Py_ssize_t idx0, Py_ssize_t idx1, Py_ssize_t idx2,
+        Py_ssize_t max_idx0, Py_ssize_t max_idx1, Py_ssize_t max_idx2):
+    return (
+            (idx0 >= 0)
+        and (idx0 < max_idx0)
+        and (idx1 >= 0)
+        and (idx1 < max_idx1)
+        and (idx2 >= 0)
+        and (idx2 < max_idx2)
+    )

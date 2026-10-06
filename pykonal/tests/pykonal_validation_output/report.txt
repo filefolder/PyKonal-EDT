@@ -1,0 +1,135 @@
+pykonal validation report (level=standard)
+============================================================
+
+
+## 0. environment & import
+  [PASS] import pykonal (0.00s)
+           - version: 0.6.0
+           - level: standard
+
+## 1. solver correctness
+  [PASS] homogeneous sphere analytic (0.12s)
+         converging, order~1.06, far-field median 0.019
+           - coarse: {'nr': 31, 'h_km': 26.67, 'dr_km': 13.33, 'arc_km': 26.67, 'shell_km': [160.0, 360.0], 'n_shell_nodes': 9888, 'frac_finite': 1.0, 'min_tt_s': 0.0, 'rel_median': 0.0328, 'rel_p90': 0.051, 'rel_max': 0.0842, 'worst_far_node': {'rel': 0.0842, 'dist_km': 164.2, 'dist_cells': 6.2, 'depth_km': 120.0, 'on_grid_boundary': False}}
+           - fine: {'nr': 51, 'h_km': 16.0, 'dr_km': 8.0, 'arc_km': 16.0, 'shell_km': [160.0, 360.0], 'n_shell_nodes': 45294, 'frac_finite': 1.0, 'min_tt_s': 0.0, 'rel_median': 0.0191, 'rel_p90': 0.0297, 'rel_max': 0.0495, 'worst_far_node': {'rel': 0.0495, 'dist_km': 161.8, 'dist_cells': 10.1, 'depth_km': 104.0, 'on_grid_boundary': False}}
+           - convergence_order: 1.058
+  [PASS] point-source solver (AK135) (0.07s)
+         PSS vs plain-FMM median difference reported
+           - frac_finite: 1.0
+           - tt_min_s: 0.8621
+           - median_PSS_minus_FMM_s: 0.7327
+  [PASS] causal stencil vs aspect ratio (0.05s)
+           - aspect_1: {'frac_finite': 1.0, 'tt_min': 0.0, 'any_negative': False}
+           - aspect_4: {'frac_finite': 1.0, 'tt_min': 0.0, 'any_negative': False}
+           - aspect_12: {'frac_finite': 1.0, 'tt_min': 0.0, 'any_negative': False}
+
+## 2. fields: IO & interpolation
+  [PASS] HDF round-trip (0.01s)
+           - max_abs_value_diff: 0.0
+           - coord_sys: spherical
+  [PASS] interpolation & null (0.00s)
+           - node_value: 8.04412
+           - midpoint_value: 8.04382
+
+## 3. build shared inventories
+  [PASS] build regional inventory (0.26s)
+           - n_station_phase: 18
+           - grid: [25, 31, 31]
+  [PASS] build global inventory (0.20s)
+           - n_station_phase: 9
+           - grid: [31, 37, 37]
+  [PASS] build regional one-sided inventory (0.23s)
+           - n_station_phase: 18
+  [PASS] build regional performance inventory (0.42s)
+           - n_stations: 16
+           - n_station_phase: 32
+
+## 3b. inventory read / crop
+  [PASS] inventory build & read-back (0.01s)
+           - n_keys: 18
+           - max_read_diff_s: 0.0
+  [PASS] max_dist masking (0.02s)
+           - frac_masked: 0.223
+           - cropped_shape: [21, 17, 19]
+
+## 4. EQLocator: EDT vs L1
+  [PASS] EDT vs L1 (clean) (2.90s)
+           - EDT: {'n_located': 10, 'epi_km_med': 0.44, 'depth_km_med': 0.7, 'total_km_med': 0.91, 'dt0_s_med': 0.025}
+           - L1: {'n_located': 10, 'epi_km_med': 0.64, 'depth_km_med': 0.44, 'total_km_med': 0.75, 'dt0_s_med': 0.036}
+  [PASS] EDT vs L1 (outliers) (1.55s)
+           - EDT: {'n_located': 10, 'epi_km_med': 0.52, 'depth_km_med': 1.11, 'total_km_med': 1.21, 'dt0_s_med': 0.066}
+           - L1: {'n_located': 10, 'epi_km_med': 0.85, 'depth_km_med': 0.64, 'total_km_med': 0.97, 'dt0_s_med': 0.057}
+           - n_outliers: 3
+  [PASS] global teleseismic (0.78s)
+           - EDT: {'n_located': 10, 'epi_km_med': 14.12, 'depth_km_med': 20.66, 'total_km_med': 29.22, 'dt0_s_med': 1.229, 'ess_med': 272.7, 'ellipsoid_semi_axes_km_med': [151.94, 37.09, 31.88], 'ellipsoid_vol_km3_med': 752484.59}
+
+## 4b. performance matrix (geometry / stations / picks)
+  [PASS] performance matrix (5.39s)
+         location error across station/pick/azimuth degradations
+           - dense_16_PS_surround: {'n_events': 12, 'n_located': 12, 'median_nobs': 32.0, 'azgap_med': 105.35, 'epi_km_med': 0.42, 'epi_km_p90': 0.72, 'depth_km_med': 0.35, 'depth_km_p90': 1.17, 'total_km_med': 0.78, 'total_km_p90': 1.37}
+           - good_12_PS_surround: {'n_events': 12, 'n_located': 12, 'median_nobs': 24.0, 'azgap_med': 135.07, 'epi_km_med': 0.43, 'epi_km_p90': 0.81, 'depth_km_med': 0.62, 'depth_km_p90': 1.2, 'total_km_med': 0.77, 'total_km_p90': 1.47}
+           - moderate_8_PS_surround: {'n_events': 12, 'n_located': 12, 'median_nobs': 16.0, 'azgap_med': 94.67, 'epi_km_med': 0.55, 'epi_km_p90': 0.96, 'depth_km_med': 0.62, 'depth_km_p90': 2.29, 'total_km_med': 0.99, 'total_km_p90': 2.39}
+           - sparse_6_P_surround: {'n_events': 12, 'n_located': 12, 'median_nobs': 6.0, 'azgap_med': 141.91, 'epi_km_med': 0.94, 'epi_km_p90': 2.59, 'depth_km_med': 1.93, 'depth_km_p90': 5.88, 'total_km_med': 2.08, 'total_km_p90': 6.38}
+           - minimal_4_P_surround: {'n_events': 12, 'n_located': 12, 'median_nobs': 4.0, 'azgap_med': 173.55, 'epi_km_med': 2.45, 'epi_km_p90': 16.1, 'depth_km_med': 6.83, 'depth_km_p90': 24.4, 'total_km_med': 7.26, 'total_km_p90': 28.59}
+           - one_sided_8_PS: {'n_events': 12, 'n_located': 11, 'median_nobs': 16.0, 'azgap_med': 223.12, 'epi_km_med': 0.81, 'epi_km_p90': 2.64, 'depth_km_med': 0.68, 'depth_km_p90': 2.74, 'total_km_med': 1.32, 'total_km_p90': 2.74}
+           - az_gap120_8_PS: {'n_events': 12, 'n_located': 12, 'median_nobs': 16.0, 'azgap_med': 183.14, 'epi_km_med': 0.71, 'epi_km_p90': 1.61, 'depth_km_med': 0.65, 'depth_km_p90': 2.25, 'total_km_med': 1.52, 'total_km_p90': 2.36}
+           - one_sided_5_P: {'n_events': 12, 'n_located': 12, 'median_nobs': 5.0, 'azgap_med': 229.26, 'epi_km_med': 4.02, 'epi_km_p90': 18.88, 'depth_km_med': 4.81, 'depth_km_p90': 14.42, 'total_km_med': 6.87, 'total_km_p90': 23.49}
+           - dropout40_12_PS: {'n_events': 12, 'n_located': 12, 'median_nobs': 14.0, 'azgap_med': 111.92, 'epi_km_med': 0.61, 'epi_km_p90': 1.04, 'depth_km_med': 1.28, 'depth_km_p90': 3.76, 'total_km_med': 1.41, 'total_km_p90': 3.79}
+           - noisy2x_10_PS: {'n_events': 12, 'n_located': 12, 'median_nobs': 20.0, 'azgap_med': 109.06, 'epi_km_med': 1.04, 'epi_km_p90': 1.84, 'depth_km_med': 0.81, 'depth_km_p90': 3.63, 'total_km_med': 1.65, 'total_km_p90': 3.74}
+           - outliers_10_PS: {'n_events': 12, 'n_located': 12, 'median_nobs': 20.0, 'azgap_med': 116.02, 'epi_km_med': 0.51, 'epi_km_p90': 1.09, 'depth_km_med': 0.35, 'depth_km_p90': 0.92, 'total_km_med': 0.7, 'total_km_p90': 1.23}
+           - worstcase_5_P_gap_noisy: {'n_events': 12, 'n_located': 12, 'median_nobs': 5.0, 'azgap_med': 250.45, 'epi_km_med': 20.27, 'epi_km_p90': 60.61, 'depth_km_med': 16.21, 'depth_km_p90': 30.79, 'total_km_med': 29.21, 'total_km_p90': 66.68}
+
+## 5. parameter sweeps
+  [PASS] alpha sweep (5.29s)
+         median total error vs alpha (0 to 0.09 step 0.005)
+           - total_km_med_by_alpha: {'alpha_0.000': 1.34, 'alpha_0.005': 1.35, 'alpha_0.010': 1.06, 'alpha_0.015': 0.95, 'alpha_0.020': 0.99, 'alpha_0.025': 1.0, 'alpha_0.030': 1.04, 'alpha_0.035': 1.27, 'alpha_0.040': 1.69, 'alpha_0.045': 2.29, 'alpha_0.050': 3.04, 'alpha_0.055': 3.87, 'alpha_0.060': 4.56, 'alpha_0.065': 4.99, 'alpha_0.070': 5.55, 'alpha_0.075': 6.02, 'alpha_0.080': 6.54, 'alpha_0.085': 7.08, 'alpha_0.090': 7.45}
+           - best_alpha: alpha_0.015
+           - best_total_km_med: 0.95
+  [PASS] edt_ot_wt x geometry (1.08s)
+         median total error: geometry x edt_ot_wt
+           - surrounded_ot_wt_off: 0.62
+           - surrounded_ot_wt_on: 0.58
+           - one_sided_ot_wt_off: 0.93
+           - one_sided_ot_wt_on: 0.97
+  [PASS] edt_exponent sweep (2.94s)
+         error / ESS / ellipsoid vs edt_exponent
+           - exp_1.0: {'total_km_med': 1.11, 'ess_med': 166.6, 'semi_axes': [5.02, 2.52, 1.63]}
+           - exp_2.0: {'total_km_med': 1.13, 'ess_med': 174.0, 'semi_axes': [6.4, 3.17, 2.04]}
+           - exp_4.0: {'total_km_med': 1.16, 'ess_med': 187.6, 'semi_axes': [7.79, 3.78, 2.46]}
+  [PASS] posterior proposal (hessian vs uniform) (0.15s)
+           - hessian: {'ess': 107.2, 'proposal_used': 'hessian', 'semi_axes_km': [2.26, 1.13, 0.87], 'ellipsoid_vol_km3': 9.337, 'library_ellipsoid_km_present': True, 'library_semi_axes_km': [2.37, 1.2, 0.87], 'library_frame': None, 'max_rel_diff_vs_scatter': 0.061}
+           - uniform: {'ess': 3.0, 'proposal_used': 'uniform', 'semi_axes_km': [23.73, 5.29, 1.13], 'ellipsoid_vol_km3': 592.609, 'library_ellipsoid_km_present': True, 'library_semi_axes_km': [28.3, 10.48, 3.74], 'library_frame': None, 'max_rel_diff_vs_scatter': 2.32}
+  [PASS] locate_seed determinism (0.10s)
+           - max_abs_diff: 0.0
+  [PASS] alpha not reset by locate() (0.13s)
+           - alpha_after_locate: 0.037
+
+## 6. vertical compression (precision vs model size)
+  [PASS] vertical compression (regional) (6.96s)
+         regional depth precision & model size vs dx:dz (vertical compression)
+           - by_ratio: {'ratio_1': {'aspect_dx_dz': 1.0, 'dx_km': 10.0, 'dz_km': 10.0, 'nr': 13, 'n_ang': 41, 'nodes_per_grid': 21853, 'MB_per_grid': 0.09, 'MB_all_grids': 0.52, 'n_located': 10, 'depth_km_med': 9.43, 'depth_km_p90': 32.24, 'total_km_med': 9.66, 'total_km_p90': 32.38, 'ellipsoid_vol_km3_med': 963.24}, 'ratio_2': {'aspect_dx_dz': 2.0, 'dx_km': 10.0, 'dz_km': 5.0, 'nr': 25, 'n_ang': 41, 'nodes_per_grid': 42025, 'MB_per_grid': 0.17, 'MB_all_grids': 1.01, 'n_located': 10, 'depth_km_med': 9.48, 'depth_km_p90': 13.18, 'total_km_med': 9.63, 'total_km_p90': 13.67, 'ellipsoid_vol_km3_med': 1044.22}, 'ratio_3': {'aspect_dx_dz': 3.0, 'dx_km': 10.0, 'dz_km': 3.33, 'nr': 37, 'n_ang': 41, 'nodes_per_grid': 62197, 'MB_per_grid': 0.25, 'MB_all_grids': 1.49, 'n_located': 10, 'depth_km_med': 7.43, 'depth_km_p90': 18.72, 'total_km_med': 7.56, 'total_km_p90': 18.77, 'ellipsoid_vol_km3_med': 918.8}, 'ratio_4': {'aspect_dx_dz': 4.0, 'dx_km': 10.0, 'dz_km': 2.5, 'nr': 49, 'n_ang': 41, 'nodes_per_grid': 82369, 'MB_per_grid': 0.33, 'MB_all_grids': 1.98, 'n_located': 10, 'depth_km_med': 7.66, 'depth_km_p90': 23.25, 'total_km_med': 7.75, 'total_km_p90': 23.44, 'ellipsoid_vol_km3_med': 962.29}, 'ratio_6': {'aspect_dx_dz': 6.0, 'dx_km': 10.0, 'dz_km': 1.67, 'nr': 73, 'n_ang': 41, 'nodes_per_grid': 122713, 'MB_per_grid': 0.49, 'MB_all_grids': 2.95, 'n_located': 10, 'depth_km_med': 3.42, 'depth_km_p90': 11.04, 'total_km_med': 4.56, 'total_km_p90': 11.06, 'ellipsoid_vol_km3_med': 784.07}, 'ratio_8': {'aspect_dx_dz': 8.0, 'dx_km': 10.0, 'dz_km': 1.25, 'nr': 97, 'n_ang': 41, 'nodes_per_grid': 163057, 'MB_per_grid': 0.65, 'MB_all_grids': 3.91, 'n_located': 10, 'depth_km_med': 7.11, 'depth_km_p90': 29.58, 'total_km_med': 7.33, 'total_km_p90': 29.79, 'ellipsoid_vol_km3_med': 887.56}, 'ratio_10': {'aspect_dx_dz': 10.0, 'dx_km': 10.0, 'dz_km': 1.0, 'nr': 121, 'n_ang': 41, 'nodes_per_grid': 203401, 'MB_per_grid': 0.81, 'MB_all_grids': 4.88, 'n_located': 10, 'depth_km_med': 2.56, 'depth_km_p90': 9.74, 'total_km_med': 3.0, 'total_km_p90': 9.77, 'ellipsoid_vol_km3_med': 882.64}}
+           - recommendation: {'recommended_ratio_dx_dz': 6.0, 'recommended_key': 'ratio_6', 'depth_km_med': 3.42, 'MB_per_grid': 0.49, 'depth_tol_used_km': 3.44}
+  [PASS] vertical compression (global) (9.45s)
+         global depth precision & model size vs dx:dz (vertical compression)
+           - by_ratio: {'ratio_1': {'aspect_dx_dz': 1.0, 'dx_km': 75.0, 'dz_km': 75.0, 'nr': 21, 'n_ang': 41, 'nodes_per_grid': 35301, 'MB_per_grid': 0.14, 'MB_all_grids': 0.85, 'n_located': 10, 'depth_km_med': 17.89, 'depth_km_p90': 45.95, 'total_km_med': 22.59, 'total_km_p90': 46.75, 'ellipsoid_vol_km3_med': 676044.03}, 'ratio_2': {'aspect_dx_dz': 2.0, 'dx_km': 75.0, 'dz_km': 37.5, 'nr': 41, 'n_ang': 41, 'nodes_per_grid': 68921, 'MB_per_grid': 0.28, 'MB_all_grids': 1.65, 'n_located': 10, 'depth_km_med': 16.26, 'depth_km_p90': 29.66, 'total_km_med': 19.66, 'total_km_p90': 35.25, 'ellipsoid_vol_km3_med': 671968.73}, 'ratio_3': {'aspect_dx_dz': 3.0, 'dx_km': 75.0, 'dz_km': 25.0, 'nr': 61, 'n_ang': 41, 'nodes_per_grid': 102541, 'MB_per_grid': 0.41, 'MB_all_grids': 2.46, 'n_located': 10, 'depth_km_med': 19.06, 'depth_km_p90': 47.66, 'total_km_med': 22.39, 'total_km_p90': 49.05, 'ellipsoid_vol_km3_med': 781452.11}, 'ratio_4': {'aspect_dx_dz': 4.0, 'dx_km': 75.0, 'dz_km': 18.75, 'nr': 81, 'n_ang': 41, 'nodes_per_grid': 136161, 'MB_per_grid': 0.54, 'MB_all_grids': 3.27, 'n_located': 10, 'depth_km_med': 13.9, 'depth_km_p90': 23.95, 'total_km_med': 17.1, 'total_km_p90': 25.37, 'ellipsoid_vol_km3_med': 807129.48}, 'ratio_6': {'aspect_dx_dz': 6.0, 'dx_km': 75.0, 'dz_km': 12.5, 'nr': 121, 'n_ang': 41, 'nodes_per_grid': 203401, 'MB_per_grid': 0.81, 'MB_all_grids': 4.88, 'n_located': 10, 'depth_km_med': 8.29, 'depth_km_p90': 48.26, 'total_km_med': 14.02, 'total_km_p90': 50.0, 'ellipsoid_vol_km3_med': 703083.42}, 'ratio_8': {'aspect_dx_dz': 8.0, 'dx_km': 75.0, 'dz_km': 9.38, 'nr': 161, 'n_ang': 41, 'nodes_per_grid': 270641, 'MB_per_grid': 1.08, 'MB_all_grids': 6.5, 'n_located': 10, 'depth_km_med': 11.48, 'depth_km_p90': 30.09, 'total_km_med': 15.68, 'total_km_p90': 35.16, 'ellipsoid_vol_km3_med': 757227.02}, 'ratio_10': {'aspect_dx_dz': 10.0, 'dx_km': 75.0, 'dz_km': 7.5, 'nr': 201, 'n_ang': 41, 'nodes_per_grid': 337881, 'MB_per_grid': 1.35, 'MB_all_grids': 8.11, 'n_located': 10, 'depth_km_med': 7.94, 'depth_km_p90': 25.33, 'total_km_med': 10.8, 'total_km_p90': 27.97, 'ellipsoid_vol_km3_med': 718399.27}}
+           - recommendation: {'recommended_ratio_dx_dz': 6.0, 'recommended_key': 'ratio_6', 'depth_km_med': 8.29, 'MB_per_grid': 0.81, 'depth_tol_used_km': 9.63}
+
+## 7. quality metrics
+  [PASS] quality metrics (0.08s)
+           - nobs: 18.0
+           - rms: 0.153
+           - azimuthal_gap: 207.74
+           - min_station_dist: 109.105
+
+## 8. robustness / edge cases
+  [PASS] too few arrivals (0.01s)
+           - returned_shape: (4,)
+  [PASS] out-of-grid arrival dropped (0.05s)
+           - n_residuals: 18
+  [PASS] inventory double-close (0.00s)
+           - double_close: ok
+  [PASS] all-outlier no crash (0.05s)
+           - finite_solution: True
+
+============================================================
+SUMMARY: PASS=29
