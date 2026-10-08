@@ -685,10 +685,10 @@ def relocate(event,
     transform = GeoTransform()
 
     # ---- traveltime grids: use what exists, optionally build what does not
-    # With no log, surface the start of a build as a warning: an FMM solve
-    # per missing grid can take minutes and must not look like a hang.
+    # With no log, still print the start of a build as a plain message:
+    # an FMM solve per missing grid can take minutes and must not look like a hang
     build_log = log if not log_discarded else (
-        lambda m: warnings.warn(m) if str(m).startswith("computing") else None)
+        lambda m: print(m, flush=True) if str(m).startswith("computing") else None)
     inventory_path, expected_missing = _ensure_grids(
         arrivals, stations_geo, transform, st, max_dist,
         build_missing=build_missing, log=build_log)
