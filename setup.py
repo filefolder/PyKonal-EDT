@@ -6,7 +6,7 @@ from Cython.Build import cythonize
 
 
 # Package meta-data.
-name            = "pykonaledt"
+name            = "pykonal"
 description     = "Solve the Eikonal equation in 3D Cartesian or spherical coordinates"
 url             = "https://github.com/filefolder/PyKonal-EDT"
 author          = "Robert Pickle (EDT branch), Malcolm C. A. White (original author (versions <0.5))"
