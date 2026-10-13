@@ -338,7 +338,16 @@ def NLL2PVT(nllfile, pvtfile, npts=None, oversample=1.0,
     # pykonal spherical axes are ascending: rho (up), theta (north->south),
     # phi (west->east).  So depth descends and latitude descends.
     depths = np.linspace(dep_max, dep_min, n_rad)
-    lats = np.linspace(lat_max, lat_min, n_lat)
+    # The theta axis is GEOCENTRIC colatitude (geo2sph), so it must be
+    # uniform in geocentric colatitude between the two geodetic bounds, and
+    # the velocities sampled at the GEODETIC latitude of each of those nodes.
+    # Spacing it by the geodetic span instead walks the nodes off their
+    # sampled latitudes: ~0.5 km over 34-36N, ~14 km over 45-10S.
+    theta_min = float(pykonal.transformations.geo2sph((lat_max, 0.0, 0.0))[1])
+    theta_max = float(pykonal.transformations.geo2sph((lat_min, 0.0, 0.0))[1])
+    thetas = np.linspace(theta_min, theta_max, n_lat)
+    _sph = np.column_stack([np.full(n_lat, EARTH_RADIUS), thetas, np.zeros(n_lat)])
+    lats = pykonal.transformations.sph2geo(_sph)[:, 0].astype(np.float64)
     lons = np.linspace(lon_min, lon_max, n_lon)
 
     # -- resample -----------------------------------------------------------
@@ -390,7 +399,7 @@ def NLL2PVT(nllfile, pvtfile, npts=None, oversample=1.0,
         (lat_max, lon_ref, dep_max))           # rho_min, theta_min, phi_min
     pvt.node_intervals = np.array([
         (dep_max - dep_min) / (n_rad - 1),
-        np.radians(lat_max - lat_min) / (n_lat - 1),
+        (theta_max - theta_min) / (n_lat - 1),
         np.radians(lon_max - lon_min) / (n_lon - 1),
     ])
     pvt.npts = npts
@@ -570,7 +579,10 @@ def PVT2NLL(pvtfile, nllfile_template=None, outfile=None, verbose=True,
     phi_mid = np.degrees(0.5 * (phi[0] + phi[-1]))
     lon = phi_mid + (lon - phi_mid + 180.0) % 360.0 - 180.0
 
-    th = np.radians(90.0 - lat)
+    # NLL's projection gives GEODETIC latitude; the field's theta axis is
+    # geocentric colatitude. 90 - lat would sample ~0.19 deg (21 km) off.
+    th = pykonal.transformations.geo2sph(
+        np.column_stack([lat, np.zeros_like(lat), np.zeros_like(lat)]))[:, 1].astype(np.float64)
     ph = np.radians(lon)
     th_c = np.clip(th, theta[0], theta[-1])
     ph_c = np.clip(ph, phi[0], phi[-1])
