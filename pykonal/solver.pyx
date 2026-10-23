@@ -653,6 +653,19 @@ class PointSourceSolver(EikonalSolver):
             self.coord_sys,
             origin
         )
+
+        # sph2sph returns phi in (-pi, pi], but a spherical grid may also be stored in [0, 2pi)
+        # (e.g. a model crossing the 180 deg meridian, or lying wholly east of it).
+        # Wrap phi into the far-field grid's own range, [min_phi, min_phi + 2pi), or every node past pi would fall
+        # outside the grid and get no velocity (NaN). Periodic grids accept any phi already.
+        if (
+            self.coord_sys == "spherical"
+            and not self.vv.iax_isperiodic[2]
+            and not self.vv.iax_isnull[2]
+        ):
+            pmin = self.vv.min_coords[2]
+            nodes[..., 2] = pmin + np.mod(nodes[..., 2] - pmin, 2 * np.pi)
+
         # Find the indices of the near-field grid nodes that are inside
         # the far-field grid.
         bool_idx = True
