@@ -893,8 +893,8 @@ cdef class EQLocator(object):
         np.ndarray bounds=None
     ):
         """
-        Locate event using Differential Evolution followed by a Nelder-Mead
-        polish.
+        Locate event. EDT: an elite-box Sobol search followed by a
+        Nelder-Mead polish (see _locate_edt). L1: differential evolution.
 
         method="l1"  : minimize the distance-weighted L1 residual norm
                        (searches x, y, z, t0 jointly; original behavior).
@@ -986,6 +986,16 @@ cdef class EQLocator(object):
         keeps both; it only closes once one mode has taken every elite
         place.
 
+        Coarse to fine. While samples are h km apart, a likelihood peak
+        narrower than h is invisible to them; with few stations and small
+        pick errors the peak can be ~1 km wide while points satisfying a
+        single station pair score almost equally across the box, so the
+        elite set never closes on it. Each stage therefore floors every
+        arrival's variance at (h * slowness)^2, the traveltime spread the
+        sampling resolution implies, and re-scores the kept points at that
+        resolution. The floor relaxes as the box closes; the final choice
+        and the polish use the exact likelihood.
+
         Assumes traveltimes have already been read for the search volume.
         """
         rng = np.random.default_rng(self.cy_locate_seed)
@@ -1003,27 +1013,37 @@ cdef class EQLocator(object):
         # Seed the incumbent at the ANCHOR, not the box centre.
         x_anchor = np.clip(np.asarray(initial[:3], dtype=np.float64), lo0, hi0)
         km = self._metric_scale(x_anchor)       # grid units -> km
+        slowness = self._median_slowness(x_anchor, km)   # s/km
         X = x_anchor[None, :].copy()
-        F = np.array([self.edt(x_anchor)])      # NEGATIVE log-L (misfit)
 
-        for stage in range(max_stages):
-            U = _sobol.sobol(n_per_stage, 3, seed=int(rng.integers(1 << 30)))
-            S = np.ascontiguousarray(lo + U * (hi - lo))
-            f = -self.edt_many(S)[0]
-            f[~np.isfinite(f)] = 1e6
-            # every sample so far that is still inside the current box
-            X = np.concatenate([X, S])
-            F = np.concatenate([F, f])
-            elite = np.argsort(F, kind="stable")[:n_elite]
-            e_lo, e_hi = X[elite].min(axis=0), X[elite].max(axis=0)
-            margin = pad * (e_hi - e_lo)
-            lo = np.maximum(e_lo - margin, lo0)
-            hi = np.minimum(e_hi + margin, hi0)
-            keep = np.all((X >= lo) & (X <= hi), axis=1)
-            X, F = X[keep], F[keep]
-            if np.all((hi - lo) * km < stop_km):
-                break
+        base_floor = self.cy_variance_floor
+        try:
+            for stage in range(max_stages):
+                # sample spacing in km, and the traveltime spread it implies
+                h = float(np.prod((hi - lo) * km) / n_per_stage) ** (1.0 / 3.0)
+                self.cy_variance_floor = max(base_floor, (h * slowness) ** 2)
+                U = _sobol.sobol(n_per_stage, 3, seed=int(rng.integers(1 << 30)))
+                S = np.ascontiguousarray(lo + U * (hi - lo))
+                # every sample so far that is still inside the box, re-scored
+                # at this stage's resolution, plus the new ones
+                X = np.ascontiguousarray(np.concatenate([X, S]))
+                F = -self.edt_many(X)[0]        # NEGATIVE log-L (misfit)
+                F[~np.isfinite(F)] = 1e6
+                elite = np.argsort(F, kind="stable")[:n_elite]
+                e_lo, e_hi = X[elite].min(axis=0), X[elite].max(axis=0)
+                margin = pad * (e_hi - e_lo)
+                lo = np.maximum(e_lo - margin, lo0)
+                hi = np.minimum(e_hi + margin, hi0)
+                keep = np.all((X >= lo) & (X <= hi), axis=1)
+                X = X[keep]
+                if np.all((hi - lo) * km < stop_km):
+                    break
+        finally:
+            self.cy_variance_floor = base_floor
 
+        # the mode of the EXACT likelihood among the surviving samples
+        F = -self.edt_many(np.ascontiguousarray(X))[0]
+        F[~np.isfinite(F)] = 1e6
         k = int(np.argmin(F))
         best_x, best_f = X[k].copy(), float(F[k])
 
@@ -1058,6 +1078,35 @@ cdef class EQLocator(object):
 
         return np.append(hypo, t0)
 
+
+    def _median_slowness(self, x, km):
+        """
+        Median over arrivals of the traveltime gradient magnitude at x, in
+        s/km (one-sided 1 km differences). 0.2 s/km (5 km/s) if no grid
+        gives a finite gradient there.
+        """
+        x = np.asarray(x, dtype=np.float64)
+        g = []
+        for key in self.cy_arrivals:
+            f = self.cy_traveltimes.get(key)
+            if f is None:
+                continue
+            t0 = f.value(x, null=np.nan)
+            if not np.isfinite(t0):
+                continue
+            d = np.empty(3)
+            for ax in range(3):
+                step = np.zeros(3)
+                step[ax] = 1.0 / km[ax]
+                t1 = f.value(x + step, null=np.nan)
+                if not np.isfinite(t1):
+                    t1 = f.value(x - step, null=np.nan)
+                    d[ax] = t0 - t1
+                else:
+                    d[ax] = t1 - t0
+            if np.all(np.isfinite(d)):
+                g.append(float(np.sqrt(np.sum(d * d))))
+        return float(np.median(g)) if g else 0.2
 
     def residuals(self, hypocenter):
         """

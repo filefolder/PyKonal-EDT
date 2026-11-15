@@ -1,5 +1,16 @@
 # pykonal validation suite
 
+Standalone harnesses, kept out of the pytest suite because they are long
+and print reports rather than assert. `pytest --runslow` runs both at
+their quick settings (see `tests/test_calibration.py`).
+
+- `pykonal_validation.py`: the end-to-end validation below.
+- `calibrate_uncertainty.py` (formerly `tests/test_uncertainty_calibration.py`):
+  ellipsoid coverage across network geometries. It drives the locator
+  with its own fixed-box contraction search, not the auto pipeline the
+  drivers use; `tests/test_calibration.py` checks coverage through that
+  pipeline.
+
 `pykonal_validation.py` is a single, **no-input** script that validates and
 benchmarks the beta `pykonal` package end to end, entirely in the native
 **spherical** `(r, θ, φ)` frame, using a 1-D **AK135** `v(r)` profile.

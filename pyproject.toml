@@ -40,9 +40,12 @@ Homepage = 'https://github.com/filefolder/PyKonal-EDT'
 
 [tool.setuptools]
 packages = ['pykonal']
-
-[tool.setuptools]
 include-package-data = false
 
 [tool.setuptools.dynamic]
 version = {attr = 'pykonal.__version__.__version__'}
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+addopts = '--import-mode=importlib -ra'
+markers = ['slow: statistical or long-running checks (run with --runslow)']

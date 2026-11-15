@@ -451,6 +451,7 @@ class PointSourceSolver(EikonalSolver):
     @dphi.setter
     def dphi(self, value):
         self._dphi = value
+        self._near_field_user_set = True
 
     @property
     def drho(self):
@@ -468,6 +469,7 @@ class PointSourceSolver(EikonalSolver):
     @drho.setter
     def drho(self, value):
         self._drho = value
+        self._near_field_user_set = True
 
     @property
     def dtheta(self):
@@ -482,6 +484,7 @@ class PointSourceSolver(EikonalSolver):
     @dtheta.setter
     def dtheta(self, value):
         self._dtheta = value
+        self._near_field_user_set = True
 
     @property
     def nphi(self):
@@ -506,6 +509,7 @@ class PointSourceSolver(EikonalSolver):
     @nrho.setter
     def nrho(self, value):
         self._nrho = value
+        self._near_field_user_set = True
 
     @property
     def ntheta(self):
@@ -538,6 +542,49 @@ class PointSourceSolver(EikonalSolver):
     @src_loc.setter
     def src_loc(self, value):
         self._src_loc = value
+
+    # Largest radial node count the automatic sizing will use before it
+    # coarsens drho instead. 33 x 64 angular nodes per radial step, so this
+    # bounds the near field at ~1.1 M nodes.
+    NRHO_MAX = 512
+
+    def far_field_cell_diagonal(self) -> float:
+        """
+        Diagonal of one far-field grid cell at the source, in the grid's
+        distance units (km for spherical grids).
+        """
+        dx = np.asarray(self.vv.node_intervals, dtype=float)
+        if self.coord_sys == "spherical":
+            r, theta = float(self.src_loc[0]), float(self.src_loc[1])
+            dx = np.array([dx[0], r * dx[1], r * np.sin(theta) * dx[2]])
+        dx = dx[~np.asarray(self.vv.iax_isnull, dtype=bool)]
+        return float(np.sqrt(np.sum(dx ** 2)))
+
+    def size_near_field(self) -> bool:
+        """
+        Make the near-field grid reach the far-field nodes around the
+        source.
+
+        The far-field solve starts from the far-field nodes that fall inside
+        the near-field grid. The default near field is 8 radial node
+        intervals across (drho = interval / 8, 64 nodes), which on grids
+        with coarse horizontal and fine radial spacing (e.g. 0.25 deg x 1 km)
+        does not reach any far-field node for a source between node columns,
+        and the whole solve then returns infinity. Here the radius is made
+        at least 1.5 far-field cell diagonals, keeping the default drho when
+        that needs no more than NRHO_MAX radial nodes and coarsening drho
+        otherwise. Values set explicitly by the caller are left alone.
+        """
+        if getattr(self, "_near_field_user_set", False):
+            return True
+        drho = self.drho                       # default: finest interval / 8
+        need = 1.5 * self.far_field_cell_diagonal()
+        nrho = max(64, int(np.ceil(need / drho)) + 1)
+        if nrho > self.NRHO_MAX:
+            nrho = self.NRHO_MAX
+            drho = need / (nrho - 1)
+        self._drho, self._nrho = drho, nrho
+        return True
 
     def initialize_near_field_grid(self) -> bool:
         """
@@ -624,8 +671,15 @@ class PointSourceSolver(EikonalSolver):
         # Sample the near-field taveltime field on the far-field nodes.
         # Make sure to filter out any NaN values.
         tt = self.near_field.tt.resample(nodes[idxs].reshape(-1, 3))
-        idxs = np.swapaxes(np.stack(idxs), 0, 1)[~np.isnan(tt)]
-        self.tt.values[(idxs[:,0], idxs[:,1], idxs[:,2])] = tt[~np.isnan(tt)]
+        good = np.isfinite(tt)
+        idxs = np.swapaxes(np.stack(idxs), 0, 1)[good]
+        if len(idxs) == 0:
+            raise RuntimeError(
+                "point-source solve failed: the near-field grid around the "
+                f"source at {np.asarray(self.src_loc)} reached no far-field "
+                "node with a finite traveltime, so the far-field solve has "
+                "nowhere to start. Is the source inside the velocity model?")
+        self.tt.values[(idxs[:,0], idxs[:,1], idxs[:,2])] = tt[good]
         return True
 
     def interpolate_far_field_velocity_onto_near_field(self) -> bool:
@@ -691,7 +745,8 @@ class PointSourceSolver(EikonalSolver):
         :return: Returns True upon successful completion.
         :rtype: bool
         """
-        # Initialize the near-field grid.
+        # Size and initialize the near-field grid.
+        self.size_near_field()
         self.initialize_near_field_grid()
         # Interpolate far-field velocity model onto near-field nodes.
         self.interpolate_far_field_velocity_onto_near_field()

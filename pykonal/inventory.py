@@ -341,6 +341,48 @@ def symmetrize_pole_rows(values, min_coords, node_intervals, npts):
     return v
 
 
+def _check_source_inside(coords, min_coords, node_intervals, npts,
+                         coord_sys="cartesian"):
+    """Raise ValueError if the source lies outside the velocity grid."""
+    coords = np.array(coords, dtype=float)
+    lo = np.asarray(min_coords, dtype=float)
+    node = np.asarray(node_intervals, dtype=float)
+    npts = np.asarray(npts)
+    hi = lo + (npts - 1) * node
+    tol = 1e-6 * np.maximum(np.abs(node), 1e-12)
+    check = np.ones(3, dtype=bool)
+    if coord_sys == "spherical":
+        # longitude wraps: compare within [lo, lo + 2 pi), and a grid that
+        # spans the full circle contains every longitude
+        coords[2] = lo[2] + np.mod(coords[2] - lo[2], 2 * np.pi)
+        if npts[2] * node[2] >= 2 * np.pi - 1e-9:
+            check[2] = False
+    out = check & ((coords < lo - tol) | (coords > hi + tol))
+    if out.any():
+        raise ValueError(
+            f"station at {np.asarray(coords)} is outside the velocity model "
+            f"(axes {np.flatnonzero(out).tolist()}; model spans {lo} to {hi}). "
+            "Clamp it onto the grid first (fit_requests_to_grid) or extend "
+            "the model")
+
+
+def _check_solved(values, coords, min_coords, node_intervals):
+    """
+    Raise ValueError unless the solve produced a usable point-source field:
+    finite traveltimes, including at the grid node nearest the source.
+    A failed solve otherwise looks like a valid grid full of inf/NaN.
+    """
+    finite = np.isfinite(values)
+    if not finite.any():
+        raise ValueError("the solve produced no finite traveltimes")
+    idx = np.rint((np.asarray(coords) - np.asarray(min_coords))
+                  / np.asarray(node_intervals)).astype(int)
+    idx = tuple(np.clip(idx, 0, np.asarray(values.shape) - 1))
+    if not finite[idx]:
+        raise ValueError("the solve left the node nearest the station "
+                         "without a finite traveltime")
+
+
 def _solve_one_traveltime(args):
     """
     Multiprocessing worker: one FMM solve. Takes/returns only picklable
@@ -366,10 +408,15 @@ def _solve_one_traveltime(args):
         if solver_kwargs:
             for attr, value in solver_kwargs.items():
                 setattr(slv, attr, value)
+        _check_source_inside(coords, vm_spec["min_coords"],
+                             vm_spec["node_intervals"], vm_spec["npts"],
+                             vm_spec["coord_sys"])
         slv.src_loc = np.asarray(coords, dtype=np.float64)
         slv.solve()
 
         tt = slv.traveltime
+        _check_solved(np.asarray(tt.values), coords, tt.min_coords,
+                      tt.node_intervals)
         _mc = np.asarray(tt.min_coords, dtype=np.float64)
         _ni = np.asarray(tt.node_intervals, dtype=np.float64)
         _npts = np.asarray(tt.npts)
@@ -799,11 +846,14 @@ def _build_one_shard(args):
     messages = []
     shard = shard_path(dirpath, key)
     try:
-        rep = ensure_traveltimes(
-            shard, {key: coords}, velocity_models,
-            max_dist=max_dist, nproc=1,
-            compress_kwargs=compress_kwargs
-        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            rep = ensure_traveltimes(
+                shard, {key: coords}, velocity_models,
+                max_dist=max_dist, nproc=1,
+                compress_kwargs=compress_kwargs
+            )
+        reasons = [str(w.message) for w in caught]
         if key in rep.get("skipped", []):
             # ensure_traveltimes' write phase creates the (empty) shard file
             # even when the solve failed; an empty shard would be linked into
@@ -813,7 +863,8 @@ def _build_one_shard(args):
                 os.remove(shard)
             except OSError:
                 pass
-            return key, "skipped by ensure_traveltimes", messages
+            return key, ("; ".join(reasons) or "skipped by ensure_traveltimes"), messages
+        messages.extend(reasons)
 
         # Sanity-guard the stored field. A traveltime must be finite and
         # non-negative; a point-source field's minimum must also be AT the
