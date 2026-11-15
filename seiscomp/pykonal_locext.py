@@ -47,7 +47,8 @@ from pykonal.locate import EQLocator
 from pykonal import constants as pk_constants
 from pykonal.transformations import GeoTransform, geo_distance_azimuth
 from pykonal.relocate import (relocate as pk_relocate, RelocationError,
-                              map_phase, normalize_phase_map)
+                              map_phase, normalize_phase_map,
+                              resolve_posterior_nsamples)
 from pykonal.sizing import chi_scale, ellipsoid_orientation
 from pykonal.inventory import (ensure_traveltimes_sharded, fit_requests_to_grid,
                                inventory_lock, resolve_max_dist,
@@ -427,7 +428,14 @@ def main():
     if _auto_delta:
         delta_km = [50.0, 50.0, 25.0]   # placeholder; recomputed per event
     delta_t = float(cfg.get("search_delta_t", 10.0))
-    nsamples = int(cfg.get("posterior_nsamples", 2048))
+    # "auto" (the default) draws until the effective sample size is reached;
+    # an integer draws exactly that many; 0 skips the uncertainty estimate.
+    nsamples = cfg.get("posterior_nsamples", "auto")
+    try:
+        _posterior_on = resolve_posterior_nsamples(nsamples)[0] > 0
+    except ValueError as _err:
+        log(f"WARNING: {_err}; using \"auto\"")
+        nsamples, _posterior_on = "auto", True
     # Number of adaptive importance-sampling rounds inside sample_posterior.
     # The solver refines its proposal to the weighted posterior moments each
     # round (2 is the library default and is plenty for a smooth ellipsoid);
@@ -830,7 +838,7 @@ def main():
         _reloc = pk_relocate(
             locator, transform, arrivals, pick_errors, stations,
             (lat0, lon0, dep0, 0.0), _settings, fixed_depth=args.fixed_depth,
-            posterior=(method == "edt" and nsamples > 0), log=log,
+            posterior=(method == "edt" and _posterior_on), log=log,
             depth_advice=" Consider --fixed-depth.",
             missing_grid_advice=(
                 " Configure velocity_models (with build_missing true) to "
@@ -896,6 +904,8 @@ def main():
         _ess_txt = ""
         try:
             _ess_txt = f" ess={float(posterior['ess']):.0f}"
+            if posterior.get("nsamples"):
+                _ess_txt += f" nsamples={int(posterior['nsamples'])}"
         except Exception:
             pass
         _t_txt = ""

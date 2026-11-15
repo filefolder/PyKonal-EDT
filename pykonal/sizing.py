@@ -34,26 +34,55 @@ import numpy as np
 
 
 __all__ = [
-    "SearchBox", "chi_scale", "auto_search_delta", "depth_axis",
+    "SearchBox", "chi_scale", "depth_axis",
     "resolve_depth_bounds", "clamp_depth_to_bounds", "size_auto_box",
     "size_fixed_box", "AUTO_DEFAULTS", "ellipsoid_orientation",
     "quakeml_rotation_matrix", "EDGE_DENSITY_LIMIT", "describe_search_box",
     "box_limit_report", "widen_truncated_axes", "cap_delta_grid",
-    "suggest_search_delta_km", "describe_widening",
+    "suggest_search_delta_km", "describe_widening", "AUTO_REMOVED",
+    "removed_auto_keys", "grid_depth_bounds", "linearised_sigma",
+    "size_posterior_box", "EDT_WIDTH_FACTOR",
 ]
 
 
 AUTO_DEFAULTS = {
+    # Half-widths [north, east, depth] km of the volume the location is
+    # searched in, and the cap on the uncertainty estimate's box.
+    "auto_search_max_km": [150.0, 150.0, 60.0],
+    # The uncertainty estimate is sampled within this many (EDT) sigma.
     "auto_search_k_sigma": 4.0,
-    "auto_search_cond_max": 1.0e6,
-    "auto_search_max_km": [200.0, 200.0, 60.0],
     "auto_search_min_km": [2.0, 2.0, 5.0],
-    "auto_search_fallback_sigma_km": [15.0, 15.0, 15.0],
     "auto_search_depth_dist_factor": 0.5,
-    "auto_search_posterior_nsamples": 512,
-    "auto_search_posterior_min_ess": 20.0,
-    "auto_search_provisional_km": [150.0, 150.0, 60.0],
 }
+
+# Keys the two-pass sizing used. Accepted and ignored, with a note, so a
+# config written for an earlier version keeps working.
+AUTO_REMOVED = {
+    "auto_search_provisional_km":
+        "the location is searched once, in auto_search_max_km",
+    "auto_search_cond_max":
+        "the geometry prediction it guarded is no longer used",
+    "auto_search_fallback_sigma_km":
+        "with no usable prediction the whole searched box is sampled",
+    "auto_search_posterior_nsamples":
+        "there is no provisional posterior any more",
+    "auto_search_posterior_min_ess":
+        "there is no provisional posterior any more",
+}
+
+# Width of the EDT posterior relative to the linearised (weighted
+# least-squares) sigma at the same solution. Measured on synthetic events
+# whose noise matched the assumed error model: 1.4-1.5 on one-sided
+# geometry, 1.5-1.6 with six stations, 1.7-1.9 with fifteen. The linearised
+# sigma only has to put the sampling box in the right place -- an axis the
+# posterior still reaches the edge of is widened afterwards -- so this is
+# the top of that range, not a tuning knob.
+EDT_WIDTH_FACTOR = 2.0
+
+
+def removed_auto_keys(cfg):
+    """[(key, why)] for removed auto_search_* keys present in `cfg`."""
+    return [(k, AUTO_REMOVED[k]) for k in (cfg or {}) if k in AUTO_REMOVED]
 
 _KM_PER_DEG = 111.195
 
@@ -64,10 +93,12 @@ class SearchBox:
     The result of sizing. `delta_grid` and `bounds` drive locate();
     `posterior_delta` drives sample_posterior() and is deliberately NOT
     depth-clamped, so a pinned or clamped depth still gets an honest
-    uncertainty measured over the full extent.
+    uncertainty measured over the full extent. In auto mode it is None
+    until the event has been located: the box for the uncertainty estimate
+    is sized at the solution (size_posterior_box).
     """
     delta_grid: np.ndarray
-    posterior_delta: np.ndarray
+    posterior_delta: Optional[np.ndarray] = None
     bounds: Optional[np.ndarray] = None
     sigma_km: Optional[np.ndarray] = None
     half_widths_km: Optional[np.ndarray] = None
@@ -156,101 +187,164 @@ def chi_scale(percent: float, dof: int) -> float:
     )
 
 
-# Geometry-based sigma
+# Linearised sigma at the solution
 # ---------------------------------------------------------------------------
-def auto_search_delta(locator, initial_xyz, arrival_keys, sigma_s,
-                      coord_sys, k_reach=3.5, cond_max=1.0e6):
+def linearised_sigma(locator, soln_xyz, coord_sys):
     """
-    Geometry-based search half-widths from the predicted location
-    covariance C = sigma^2 (G^T G)^-1. Each row of G is one arrival's
-    traveltime spatial gradient at the trial hypocenter (the ray slowness
-    vector) plus a unit origin-time column.
+    Per-axis 1-sigma (km, grid-axis order) of the weighted least-squares
+    location covariance C = (G^T W G)^-1 at `soln_xyz`.
 
-    Spherical grids: axis 0 is r (radius, km; depth = R - r), axes 1-2 are
-    colatitude and longitude in RADIANS. The finite-difference step is one
-    node interval per axis (a flat step in radians would land off-grid),
-    and the angular derivatives are converted to per-km via the local
-    metric (d/dtheta / r, d/dphi / (r sin theta)) so all three columns of G
-    are d(tt)/d(distance_km). The returned half-widths are converted back
-    to grid units for the locator.
+    Each row of G is one arrival's traveltime gradient at the solution, in
+    s/km in the local frame, plus a unit origin-time column, so origin time
+    is eliminated rather than assumed known. W holds 1/variance with the
+    variance the posterior itself uses: pick error^2 + (alpha * traveltime)^2,
+    floored at the locator's variance floor and at the a-posteriori residual
+    variance (see EQLocator.sample_posterior).
 
-    NOTE: C assumes INDEPENDENT residuals. Where the velocity model does
-    not fit, residuals trend with distance, the effective number of
-    independent observations is well below N, and this underestimates the
-    true spread -- worst on depth, which trades against origin time. That
-    is why size_auto_box() also measures a posterior and takes the larger.
+    This sizes the box the uncertainty estimate is sampled in; it is not the
+    reported uncertainty. Measured against sampled posteriors it is within a
+    few percent in the median but under-covers on its own (57-65% inside its
+    nominal 68% ellipsoid), because the problem is not linear over a region
+    several sigma wide.
 
-    Returns (delta_grid, info). info has: sigma (per-axis 1-sigma in km, in
-    grid-axis order), cond (of G^T G), n (rows used), weak (cond>cond_max).
-    Returns (None, info) if too few gradients or the inverse fails.
+    Gradients are central differences one node interval wide, one-sided
+    where a neighbour falls outside the loaded grid. Arrivals with no
+    traveltime at the solution are skipped.
+
+    Returns (sigma_km, info). sigma_km is None when fewer than four arrivals
+    have a gradient or G^T W G cannot be inverted; info has n (rows used).
     """
     spherical = (coord_sys == "spherical")
-    r0 = float(initial_xyz[0]) if spherical else None
-    theta0 = float(initial_xyz[1]) if spherical else None
-    rows = []
-    info = {"sigma": None, "cond": float("inf"), "n": 0, "weak": True}
+    x0 = np.asarray(soln_xyz, dtype=float)[:3].copy()
+    if spherical:
+        metric = np.array([1.0, x0[0],
+                           x0[0] * max(abs(math.sin(x0[1])), 1e-6)])
+    else:
+        metric = np.ones(3)
+    info = {"n": 0}
 
-    for key in arrival_keys:
-        field_ = locator.traveltimes.get(key) if hasattr(
-            locator, "traveltimes") else None
+    arrivals = locator.arrivals
+    fields_ = locator.traveltimes
+    pick_errors = locator.pick_errors or {}
+    default_err = float(locator.default_pick_error)
+    alpha = float(locator.alpha)
+
+    rows, tts, sig, res = [], [], [], []
+    for key, t_obs in arrivals.items():
+        field_ = fields_.get(key)
         if field_ is None:
             continue
+        try:
+            tt0 = float(field_.value(x0))
+        except Exception:
+            continue
+        if not np.isfinite(tt0) or tt0 > 9999:
+            continue
         node = np.asarray(field_.node_intervals, dtype=float)
-        grad, ok = [], True
+        grad = []
         for ax in range(3):
-            h = float(node[ax])
-            if not np.isfinite(h) or h <= 0:
-                ok = False
+            h0 = float(node[ax])
+            if not np.isfinite(h0) or h0 <= 0:
                 break
-            xp = np.asarray(initial_xyz, dtype=float).copy()
-            xm = np.asarray(initial_xyz, dtype=float).copy()
-            xp[ax] += h
-            xm[ax] -= h
-            try:
-                tp = field_.value(xp)
-                tm = field_.value(xm)
-            except Exception:
-                ok = False
+            d = None
+            # A full node interval first; a quarter of one when both
+            # neighbours are outside the loaded grid, which happens on the
+            # depth axis of a pinned-depth search (a slab a few km thick).
+            for h in (h0, 0.25 * h0):
+                xp, xm = x0.copy(), x0.copy()
+                xp[ax] += h
+                xm[ax] -= h
+                tp, tm = float(field_.value(xp)), float(field_.value(xm))
+                okp = np.isfinite(tp) and tp <= 9999
+                okm = np.isfinite(tm) and tm <= 9999
+                if okp and okm:
+                    d = (tp - tm) / (2.0 * h)
+                elif okp:
+                    d = (tp - tt0) / h
+                elif okm:
+                    d = (tt0 - tm) / h
+                if d is not None:
+                    break
+            if d is None:
                 break
-            if not (np.isfinite(tp) and np.isfinite(tm)):
-                ok = False
-                break
-            d = (tp - tm) / (2.0 * h)
-            if spherical:                       # radians -> per-km
-                if ax == 1:
-                    d /= r0
-                elif ax == 2:
-                    d /= (r0 * max(math.sin(theta0), 1e-6))
-            grad.append(d)
-        if ok and len(grad) == 3:
-            rows.append(grad + [1.0])           # unit origin-time column
+            grad.append(d / metric[ax])
+        if len(grad) != 3:
+            continue
+        rows.append(grad + [1.0])
+        tts.append(tt0)
+        sig.append(float(pick_errors.get(key, default_err)))
+        res.append(float(t_obs) - tt0)
 
     info["n"] = len(rows)
     if len(rows) < 4:
         return None, info
 
+    tts, sig, res = np.array(tts), np.array(sig), np.array(res)
+    floor = float(locator.variance_floor)
+    if len(res) > 4:
+        r = res - np.median(res)
+        floor = max(floor, float(np.sum(r * r) / (len(res) - 4)))
+    var = np.maximum(np.maximum(sig, 1e-5) ** 2 + (alpha * tts) ** 2, floor)
+
     G = np.array(rows)
-    GtG = G.T @ G
     try:
-        cond = float(np.linalg.cond(GtG))
-        C = sigma_s ** 2 * np.linalg.inv(GtG)
+        C = np.linalg.inv(G.T @ (G / var[:, None]))
     except np.linalg.LinAlgError:
         return None, info
+    d = np.diag(C)[:3]
+    if not np.all(np.isfinite(d)) or np.any(d <= 0):
+        return None, info
+    return np.sqrt(d), info
 
-    sigma_km = np.sqrt(np.clip(np.diag(C)[:3], 0.0, None))
-    info["cond"] = cond
-    info["sigma"] = sigma_km
-    info["weak"] = cond > cond_max
-    hw_km = k_reach * sigma_km
-    if spherical:
-        delta_grid = np.array([
-            hw_km[0],
-            hw_km[1] / r0,
-            hw_km[2] / (r0 * max(math.sin(theta0), 1e-6)),
-        ], dtype=float)
-    else:
-        delta_grid = hw_km
-    return delta_grid, info
+
+def grid_depth_bounds(locator, transform, arrival_keys, at_xyz,
+                      depth_min=None, depth_max=None, max_grids=8):
+    """
+    Fill an unset depth_min / depth_max from the traveltime grids.
+
+    A depth the grids do not reach has no traveltime, so searching it only
+    wastes samples: an unbounded auto box anchored at 10 km ran from 23 km
+    ABOVE the surface to 43 km below it. Bounds the operator set are
+    returned unchanged; an unset one becomes the vertical extent common to
+    the grids. Grids built from one velocity model share that extent, so at
+    most `max_grids` are inspected (three small reads each), spread across
+    the arrivals so both phases are represented.
+
+    Returns (depth_min, depth_max, from_grid); from_grid is True when
+    either value came from the grids.
+    """
+    if depth_min is not None and depth_max is not None:
+        return depth_min, depth_max, False
+    inventory = getattr(locator, "traveltime_inventory", None)
+    if inventory is None:
+        return depth_min, depth_max, False
+    iz = depth_axis(transform.coord_sys)
+    keys = [k for k in arrival_keys if inventory.has("/".join(k))]
+    if not keys:
+        return depth_min, depth_max, False
+    step = max(1, len(keys) // max_grids)
+    tops, bottoms = [], []
+    for key in keys[::step][:max_grids]:
+        try:
+            g = inventory.f5["/".join(key)]
+            lo = float(g["min_coords"][iz])
+            hi = lo + (int(g["npts"][iz]) - 1) * float(g["node_intervals"][iz])
+        except Exception:
+            continue
+        ends = []
+        for v in (lo, hi):
+            x = np.asarray(at_xyz, dtype=float)[:3].copy()
+            x[iz] = v
+            ends.append(float(transform.grid_to_geo(x)[2]))
+        tops.append(min(ends))
+        bottoms.append(max(ends))
+    if not tops:
+        return depth_min, depth_max, False
+    top, bottom = max(tops), min(bottoms)      # common to all inspected
+    if top >= bottom:
+        return depth_min, depth_max, False
+    return (top if depth_min is None else depth_min,
+            bottom if depth_max is None else depth_max, True)
 
 
 # Depth bounds and clamping
@@ -360,12 +454,10 @@ def apply_floors_and_cap(hw_km, sigma_km, coord_sys, cfg, *,
     Raise the half-widths to the floors, then cap them. Order matters: a
     floor must never exceed auto_search_max_km, which bounds the grid volume.
 
-    Floor 1 (coverage): the box must contain the provisional solution. The
-      provisional pass searches wide and the real pass searches k*sigma
-      around the SAME anchor, with nothing otherwise checking that the second
-      contains the first. Where pass 1 moved the event a long way, a tight
-      box centred back on the anchor cannot reach it, and since the search is
-      seeded at the anchor the result is a confident location AT the anchor.
+    Floor 1 (coverage): only when `provisional_offset_km` is given. It was
+      needed while a second, tighter search was centred back on the anchor;
+      the box sized here is now centred on the solution, so size_posterior_box
+      does not pass it.
 
     Floor 2 (depth resolution): depth is not resolvable much better than the
       nearest station offset, because beyond roughly one focal depth the
@@ -400,7 +492,7 @@ def apply_floors_and_cap(hw_km, sigma_km, coord_sys, cfg, *,
     hw = np.maximum.reduce([hw, hw_cov, hw_geom, hw_abs])
     floored = [n for n, a, b in zip(names, raw, hw) if b > a + 1e-6]
     if floored:
-        log("search_delta auto: half-width floored on " + ", ".join(floored)
+        log("auto box: half-width floored on " + ", ".join(floored)
             + " (k*sigma would have given "
             + "/".join(f"{v:.1f}" for v in raw) + " km, using "
             + "/".join(f"{v:.1f}" for v in hw) + " km)")
@@ -409,7 +501,7 @@ def apply_floors_and_cap(hw_km, sigma_km, coord_sys, cfg, *,
     capped = [n for n, a, c in zip(names, hw, cap_km) if a > c + 1e-6]
     hw = np.minimum(hw, cap_km)
     if capped:
-        log("search_delta auto: half-width capped by auto_search_max_km on "
+        log("auto box: half-width capped by auto_search_max_km on "
             + ", ".join(capped) + " (using "
             + "/".join(f"{v:.1f}" for v in hw) + " km)")
     return hw
@@ -452,177 +544,43 @@ def size_fixed_box(transform, initial, delta_t, search_delta_km, dep0_km, *,
 
 
 def size_auto_box(locator, transform, initial, delta_t, *,
-                  arrival_keys, dep0_km, lat0, lon0,
-                  cfg=None, method="edt", alpha=0.01,
-                  default_pick_error=0.1, posterior_seed=None,
-                  station_distances_km=None,
+                  arrival_keys=None, dep0_km, lat0, lon0, cfg=None,
                   fixed_depth=None, fixed_depth_tolerance=2.0,
-                  depth_min=None, depth_max=None,
-                  log=None, stage=None):
+                  depth_min=None, depth_max=None, log=None, **_unused):
     """
-    Two-pass geometry-based sizing.
+    The volume an "auto" location is searched in: auto_search_max_km around
+    the anchor, with the depth pin and depth bounds applied.
 
-    The box must scale with the ACTUAL location uncertainty, which is set by
-    how well the model fits -- the a posteriori data variance
-    s^2 = sum(r^2)/(N-M) -- not by the nominal pick error, which is only a
-    floor. The misfit is unknown before locating, so:
+    The event is located ONCE, in this box. Earlier versions located twice:
+    a provisional pass here, then a second pass in a k*sigma box centred
+    back on the anchor, sized from a provisional posterior and a geometry
+    prediction. Measured on synthetic events the second pass moved the
+    solution by a median of 10-30 m against sigmas of 1-10 km, and once in
+    40 one-sided events it left the solution 36 km away on a worse misfit,
+    so it cost a second search and bought nothing. The geometry prediction
+    never set the box either: it came out at 0.6-0.7 of the final sigma and
+    the larger of the two estimates was always the provisional posterior.
 
-      pass 1: locate in a wide provisional box, measure the rms residual and
-              sample a cheap posterior;
-      pass 2: size from max(geometry prediction, measured posterior), apply
-              the floors and the cap, then clamp depth.
+    The box for the uncertainty estimate is sized afterwards, at the
+    solution: see size_posterior_box.
 
-    `station_distances_km` is an optional {(net, sta): distance_km} or a bare
-    sequence of distances, used only for floor 2.
+    Extra keyword arguments the two-pass version took (method, alpha,
+    default_pick_error, posterior_seed, station_distances_km, stage) are
+    accepted and ignored.
 
-    Returns a SearchBox. The caller performs pass 2 itself.
+    Returns a SearchBox with posterior_delta None.
     """
     log = log or _noop
-    stage = stage or _noop
     cfg = cfg or {}
     coord_sys = transform.coord_sys
-    k = float(_cfg(cfg, "auto_search_k_sigma"))
     initial = np.asarray(initial, dtype=float)
     initial_xyz = initial[:3]
 
-    # ---- pass 1: wide provisional box
-    prov = _grid_order_to_delta(
-        transform, _config_to_grid_order(_cfg(cfg, "auto_search_provisional_km"),
-                                         coord_sys), initial_xyz)
-    prov = np.minimum(prov, _grid_order_to_delta(
-        transform, _config_to_grid_order(_cfg(cfg, "auto_search_max_km"),
-                                         coord_sys), initial_xyz))
-    locator.read_traveltimes(min_coords=(initial_xyz - prov),
-                             max_coords=(initial_xyz + prov))
-    stage("provisional read_traveltimes")
-    prov_soln = np.asarray(
-        locator.locate(initial, np.append(prov, delta_t), alpha, method),
-        dtype=float)
-    stage("provisional locate (pass 1)")
+    hw = _config_to_grid_order(_cfg(cfg, "auto_search_max_km"), coord_sys)
+    delta_grid = np.abs(_grid_order_to_delta(transform, hw, initial_xyz))
 
-    prov_res = locator.residuals(prov_soln)
-    if prov_res:
-        rv = np.array(list(prov_res.values()), dtype=float)
-        s_data = float(np.sqrt(np.sum(rv ** 2) / max(len(rv) - 4, 1)))
-    else:
-        s_data = float(default_pick_error)
-    s_eff = max(s_data, float(default_pick_error))
-
-    # ---- measured sigma from a cheap posterior in the provisional box
-    meas_sig = None
-    prov_n = int(_cfg(cfg, "auto_search_posterior_nsamples"))
-    if method == "edt" and prov_n > 0:
-        try:
-            pp = locator.sample_posterior(prov_soln[:3], prov, nsamples=prov_n,
-                                          nscatter=0, seed=posterior_seed,
-                                          rounds=2)
-            s = np.sqrt(np.clip(
-                np.diag(np.asarray(pp["covariance_km"], float)), 0.0, None))
-            pess = float(pp.get("ess", float("nan")))
-            pmc = pp.get("sigma_rel_mcse")
-            pmc = float("nan") if pmc is None else float(pmc)
-            ess_min = float(_cfg(cfg, "auto_search_posterior_min_ess"))
-            if np.all(np.isfinite(s)) and s.min() > 0 and pess >= ess_min \
-                    and (not np.isfinite(pmc) or pmc < 0.5):
-                meas_sig = s
-                edge = np.asarray(pp.get("at_search_edge", [False] * 3),
-                                  dtype=bool)
-                if edge.any():
-                    hit = ", ".join(n for n, e in zip(axis_names(coord_sys), edge)
-                                    if e)
-                    log(f"search_delta auto: provisional solution sits against "
-                        f"the searched edge on {hit} -- the likelihood is "
-                        f"monotone there and the data do not locate that axis "
-                        f"at all")
-            else:
-                log(f"search_delta auto: provisional posterior not usable for "
-                    f"sizing (ess={pess:.0f}, mcse={pmc:.2f}); using the "
-                    f"geometry prediction")
-        except Exception as exc:
-            log(f"search_delta auto: provisional posterior failed ({exc}); "
-                f"using the geometry prediction")
-    stage("provisional posterior")
-
-    # ---- geometry prediction
-    _adx, ainfo = auto_search_delta(
-        locator, initial_xyz, list(arrival_keys), s_eff, coord_sys,
-        k_reach=k, cond_max=float(_cfg(cfg, "auto_search_cond_max")))
-
-    sig_pred = ainfo.get("sigma")
-    if sig_pred is None:
-        # Fall back to a wide SIGMA, never to a wide box: a box assigned
-        # directly bypasses the cap, the floors and the measured posterior.
-        if meas_sig is not None:
-            sigma = meas_sig
-            why = "geometry unusable; sized from the measured provisional posterior"
-        else:
-            sigma = _config_to_grid_order(
-                _cfg(cfg, "auto_search_fallback_sigma_km"), coord_sys)
-            why = "geometry unusable and no measured posterior; wide default sigma"
-        log(f"search_delta auto: {why} (insufficient or near-singular "
-            f"gradients, s_data={s_data:.2f}s)")
-    elif meas_sig is not None:
-        # Take the LARGER per axis: the failure mode is one-sided. A box
-        # narrower than the peak truncates the pdf and understates the
-        # uncertainty; an oversized box only costs sampling density.
-        sigma = np.maximum(sig_pred, meas_sig)
-    else:
-        sigma = sig_pred
-
-    hw = k * np.asarray(sigma, dtype=float)
-
-    # ---- floors and cap
-    prov_geo = transform.grid_to_geo(prov_soln[:3])
-    off_lat = abs(float(prov_geo[0]) - lat0) * _KM_PER_DEG
-    # wrap the longitude difference into [-180, 180]: across the antimeridian
-    dlon = (float(prov_geo[1]) - lon0 + 180.0) % 360.0 - 180.0
-    off_lon = abs(dlon) * _KM_PER_DEG * math.cos(math.radians(lat0))
-    off_dep = abs(float(prov_geo[2]) - dep0_km)
-    offset = (np.array([off_dep, off_lat, off_lon]) if coord_sys == "spherical"
-              else np.array([off_lat, off_lon, off_dep]))
-
-    dmin_km = None
-    if station_distances_km:
-        vals = (list(station_distances_km.values())
-                if isinstance(station_distances_km, dict)
-                else list(station_distances_km))
-        vals = [v for v in vals if v is not None and np.isfinite(v)]
-        if vals:
-            dmin_km = min(vals)
-
-    hw = apply_floors_and_cap(hw, sigma, coord_sys, cfg,
-                              provisional_offset_km=offset,
-                              min_station_dist_km=dmin_km, log=log)
-
-    delta_grid = _grid_order_to_delta(transform, hw, initial_xyz)
-
-    cd = ainfo.get("cond", float("inf"))
-    cd_s = "undefined" if not np.isfinite(cd) else "%.1e" % cd
-    weak = "" if not ainfo.get("weak") else \
-        f" [WEAK geometry: cond={cd_s}, depth poorly constrained]"
-    ratio = ("" if (meas_sig is None or sig_pred is None) else
-             " measured/predicted sigma ratio "
-             + "/".join(f"{m / max(p, 1e-6):.1f}"
-                        for m, p in zip(meas_sig, sig_pred)))
-    lab = ((sigma[1], sigma[2], sigma[0], hw[1], hw[2], hw[0])
-           if coord_sys == "spherical"
-           else (sigma[0], sigma[1], sigma[2], hw[0], hw[1], hw[2]))
-    log(f"search_delta auto: data_std={s_data:.2f}s "
-        f"(floor {float(default_pick_error):.2f}s) -> 1-sigma(km) "
-        f"lat={lab[0]:.2f} lon={lab[1]:.2f} dep={lab[2]:.2f}, k={k:.1f} -> "
-        f"half-widths(km) lat={lab[3]:.1f} lon={lab[4]:.1f} dep={lab[5]:.1f} "
-        f"(cond={cd_s}, n={ainfo['n']}){weak}{ratio}")
-
-    # ---- depth: pin and/or clamp
     depth_min, depth_max, pinned = resolve_depth_bounds(
         fixed_depth, depth_min, depth_max)
-
-    # The posterior delta keeps the FULL depth extent even when the depth is
-    # pinned or clamped. The bounds pin the LOCATION; suppressing the
-    # uncertainty too would discard a real number -- an analyst fixing depth
-    # at 10 km needs to know whether the data tolerate 10 +/- 2 or 10 +/- 30.
-    posterior_delta = delta_grid.copy()
-
     if pinned:
         delta_grid = delta_grid.copy()
         delta_grid[depth_axis(coord_sys)] = _pin_half_width(
@@ -633,17 +591,58 @@ def size_auto_box(locator, transform, initial, delta_t, *,
                                    dep0_km, depth_min, depth_max, lat0, lon0,
                                    min_half_width_km=fixed_depth_tolerance,
                                    log=log)
+    return SearchBox(delta_grid=delta_grid, posterior_delta=None,
+                     bounds=bounds, half_widths_km=hw, depth_pinned=pinned,
+                     info={"mode": "auto"})
 
-    return SearchBox(
-        delta_grid=delta_grid, posterior_delta=posterior_delta, bounds=bounds,
-        sigma_km=np.asarray(sigma, dtype=float), half_widths_km=hw,
-        depth_pinned=pinned, provisional_solution=prov_soln,
-        info={"mode": "auto", "s_data": s_data, "s_eff": s_eff,
-              "sigma_predicted": sig_pred, "sigma_measured": meas_sig,
-              "cond": cd, "n_gradients": ainfo["n"], "weak": ainfo.get("weak"),
-              "min_station_dist_km": dmin_km},
-    )
 
+def size_posterior_box(locator, transform, soln_xyz, *, cfg=None,
+                       min_station_dist_km=None, log=None):
+    """
+    Half-widths (grid units) of the box the uncertainty estimate is sampled
+    in, centred on the solution, for "auto" mode.
+
+    auto_search_k_sigma * EDT_WIDTH_FACTOR * the linearised sigma at the
+    solution, raised to the depth-resolution and absolute floors and capped
+    by auto_search_max_km (apply_floors_and_cap). When the linearised sigma
+    is unusable -- fewer than four gradients, or a singular geometry -- the
+    cap itself is returned: the whole searched volume is sampled, which
+    costs sampling density but cannot truncate anything.
+
+    The box only has to be roughly right. sample_posterior treats it as a
+    rejection boundary, and relocate() widens any axis the posterior still
+    reaches the edge of.
+
+    Returns (delta_grid, info); info has sigma_km (or None), half_widths_km
+    and n_gradients.
+    """
+    log = log or _noop
+    cfg = cfg or {}
+    coord_sys = transform.coord_sys
+    soln_xyz = np.asarray(soln_xyz, dtype=float)[:3]
+    k = float(_cfg(cfg, "auto_search_k_sigma"))
+    cap_km = _config_to_grid_order(_cfg(cfg, "auto_search_max_km"), coord_sys)
+
+    sigma, linfo = linearised_sigma(locator, soln_xyz, coord_sys)
+    if sigma is None:
+        hw = np.asarray(cap_km, dtype=float).copy()
+        log(f"uncertainty box: no usable linearised sigma "
+            f"({linfo['n']} gradient(s)); sampling the whole searched box")
+    else:
+        hw = apply_floors_and_cap(k * EDT_WIDTH_FACTOR * sigma, sigma,
+                                  coord_sys, cfg,
+                                  min_station_dist_km=min_station_dist_km,
+                                  log=log)
+        iz = depth_axis(coord_sys)
+        h = [a for a in range(3) if a != iz]
+        log(f"uncertainty box: linearised 1-sigma(km) north-south="
+            f"{sigma[h[0]]:.2f} east-west={sigma[h[1]]:.2f} "
+            f"depth={sigma[iz]:.2f} (n={linfo['n']}) -> half-widths(km) "
+            f"north-south={hw[h[0]]:.1f} east-west={hw[h[1]]:.1f} "
+            f"depth={hw[iz]:.1f}")
+    delta_grid = np.abs(_grid_order_to_delta(transform, hw, soln_xyz))
+    return delta_grid, {"sigma_km": sigma, "half_widths_km": hw,
+                        "n_gradients": linfo["n"]}
 
 
 # Ellipsoid help for QML
@@ -771,13 +770,16 @@ def cap_delta_grid(transform, at, cfg=None):
 
 def widen_truncated_axes(posterior, sampled_delta_grid, cap_grid,
                          coord_sys="spherical", limit=EDGE_DENSITY_LIMIT,
-                         target_k=4.0, min_factor=1.5, max_factor=3.0):
+                         target_k=4.0, min_factor=1.5, max_factor=3.0,
+                         widen_depth=False):
     """
     Half-widths for a second posterior pass, or None if none is needed.
 
-    Only HORIZONTAL axes whose edge density exceeds `limit` and that are
-    still below the cap are widened; depth truncation means the arrivals
-    do not constrain depth, which a bigger box does not fix. The factor
+    Axes whose edge density exceeds `limit` and that are still below the
+    cap are widened. Depth is included only with widen_depth=True, which
+    the auto path sets: its depth box comes from a linearised sigma that
+    can be too small, so reaching the edge does not yet mean the arrivals
+    cannot constrain depth. Once depth is at the cap it does. The factor
     comes from the Gaussian relation edge = exp(-k^2/2): the box currently
     sits at k_eff = sqrt(-2 ln edge) sigma, so scale it by target_k / k_eff,
     kept within [min_factor, max_factor] because EDT tails are heavier than
@@ -795,7 +797,7 @@ def widen_truncated_axes(posterior, sampled_delta_grid, cap_grid,
     cap = np.abs(np.asarray(cap_grid, dtype=float))
     widened, capped = [], []
     for a in range(3):
-        if a == iz or edge[a] <= limit:
+        if (a == iz and not widen_depth) or edge[a] <= limit:
             continue
         k_eff = math.sqrt(-2.0 * math.log(min(max(edge[a], 1e-12), 0.999)))
         factor = min(max(target_k / k_eff, min_factor), max_factor)

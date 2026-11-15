@@ -224,12 +224,6 @@ cdef class Heap(object):
             has_right = j_right < j_end
             idx_child = self.cy_keys[j_child]
             # Only read cy_keys[j_right] when it's actually in bounds.
-            # The original code indexed cy_keys[j_right] unconditionally
-            # before checking j_right < j_end; std::vector::operator[] does
-            # no bounds checking, so when j_right == j_end (the common case
-            # of a parent with only a left child) that was an out-of-bounds
-            # read -- undefined behavior in C++, on every pop() in the
-            # solver's hot loop.
             if has_right:
                 idx_right = self.cy_keys[j_right]
                 if not self.cy_values[idx_child.i1, idx_child.i2, idx_child.i3] < self.cy_values[idx_right.i1, idx_right.i2, idx_right.i3]:

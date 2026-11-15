@@ -72,14 +72,10 @@ cdef class EQLocator(object):
         # is heavily disfavoured but never assigned exactly zero
         # probability (which would punch holes in the search surface).
         self.cy_edt_ot_wt_floor     = log(0.00001)
-        # Differential-evolution search controls for the EDT locator.
-        # Larger popsize/maxiter make the global search more robust on
-        # rough/ridged surfaces at the cost of runtime; tol is the DE
-        # convergence tolerance. Exposed as properties for tuning.
-        # Fixed default seed makes the DE search deterministic: the same
-        # input yields the same solution across repeated calls / processes
-        # (e.g. scolv relocating twice). Set locate_seed=None for the old
-        # nondeterministic behavior.
+        # Seed for the EDT search's Sobol scrambles (and the L1 method's
+        # differential evolution). None, the default, draws fresh randomness
+        # on every call; results then differ between runs by metres. Set an
+        # integer for bit-identical locations.
         self.cy_locate_seed         = None
         self.cy_keys                = None
         self.cy_tt_fields           = None
@@ -368,9 +364,9 @@ cdef class EQLocator(object):
     @property
     def locate_seed(self):
         """
-        Random seed for the differential-evolution search in locate().
-        An integer makes results reproducible; None (which is the default)
-        restores nondeterministic behavior (fresh randomness each call).
+        Random seed for the search in locate(). An integer makes results
+        bit-reproducible; None (the default) draws fresh randomness each
+        call, and repeated runs then differ by metres.
         """
         return self.cy_locate_seed
 
@@ -655,6 +651,7 @@ cdef class EQLocator(object):
             self._prepare_workspace()
 
         n = len(self.cy_keys)
+        self.cy_last_ot = NAN
         if self._fill_traveltimes(hypo_xyz) < 2:
             return -INFINITY
 
@@ -725,6 +722,7 @@ cdef class EQLocator(object):
                 ot_wsum += ot_w
             if ot_wsum > 0.0 and nvalid > 0:
                 ot_mean = ot_sum / ot_wsum
+                self.cy_last_ot = ot_mean
                 for ia in range(n):
                     tta = self.cy_tt_work[ia]
                     if isinf(tta):
@@ -741,6 +739,16 @@ cdef class EQLocator(object):
             + ot_var_weight
         )
 
+
+    def edt_many(EQLocator self, constants.REAL_t[:, :] pts):
+        """log-likelihood and EDT-weighted origin time at each row of pts."""
+        cdef Py_ssize_t i, m = pts.shape[0]
+        cdef np.ndarray[constants.REAL_t, ndim=1] ll = np.empty(m, dtype=np.float64)
+        cdef np.ndarray[constants.REAL_t, ndim=1] ot = np.empty(m, dtype=np.float64)
+        for i in range(m):
+            ll[i] = self.edt_log_likelihood(pts[i])
+            ot[i] = self.cy_last_ot
+        return ll, ot
 
     cpdef constants.REAL_t edt(EQLocator self, constants.REAL_t[:] hypo_xyz):
         """
@@ -962,64 +970,89 @@ cdef class EQLocator(object):
         a local optimizer to a single minimum (which wanders on the flat /
         multi-modal EDT surface produced by weak or large-azimuthal-gap
         geometry), the hypocenter is taken as the MAXIMUM of the sampled
-        EDT likelihood surface -- the mode of the PDF, exactly what NLL's
+        EDT likelihood surface- the mode of the PDF, exactly what NLL's
         oct-tree importance sampling reports.
 
-        Implementation is a lightweight oct-tree analog: sample the search
-        box, keep the best sample, contract the box around it, resample,
-        and repeat. Because the estimate is the peak of a sampled surface
-        (not an optimizer landing point), it is stable against the starting
-        origin and does not require fabricating curvature.
-        A final local polish refines to sub-node precision. The companion
-        sample_posterior() then reports the honest (often large) ellipsoid.
+        The search samples the box with scrambled Sobol points, then
+        shrinks the box to the padded bounding box of the best few samples
+        seen so far, and repeats until that box is under a kilometre
+        across. A final Nelder-Mead polish, run in kilometres, refines to
+        sub-node precision.
+
+        Shrinking to the bounding box of an ELITE SET, rather than by a
+        fixed factor around the single best sample, is what makes this
+        safe as the only search over a wide box. While two modes are still
+        in contention their samples are both in the elite set and the box
+        keeps both; it only closes once one mode has taken every elite
+        place.
 
         Assumes traveltimes have already been read for the search volume.
-        The sampling schedule (samples per stage, number of contraction
-        stages, and shrink factor) is fixed internally; only locate_seed
-        affects it, keeping results reproducible.
         """
         rng = np.random.default_rng(self.cy_locate_seed)
 
-        lo = np.asarray(min_coords[:3], dtype=np.float64).copy()
-        hi = np.asarray(max_coords[:3], dtype=np.float64).copy()
+        lo0 = np.asarray(min_coords[:3], dtype=np.float64).copy()
+        hi0 = np.asarray(max_coords[:3], dtype=np.float64).copy()
+        lo, hi = lo0.copy(), hi0.copy()
 
-        # Fixed sampling schedule (oct-tree analog): samples per stage,
-        # number of contraction stages, and box shrink factor per stage.
-        n_per_stage = 1000
-        n_stages = 7
-        contract = 0.6
+        n_per_stage = 500       # Sobol points per stage
+        n_elite = 20            # best samples whose bounding box is kept
+        pad = 0.25              # margin added to that bounding box
+        max_stages = 16
+        stop_km = 1.0           # hand over to the polish below this size
 
         # Seed the incumbent at the ANCHOR, not the box centre.
-        best_x = np.clip(np.asarray(initial[:3], dtype=np.float64), lo, hi)
-        best_f = self.edt(best_x)      # edt() returns NEGATIVE log-L (misfit)
+        x_anchor = np.clip(np.asarray(initial[:3], dtype=np.float64), lo0, hi0)
+        km = self._metric_scale(x_anchor)       # grid units -> km
+        X = x_anchor[None, :].copy()
+        F = np.array([self.edt(x_anchor)])      # NEGATIVE log-L (misfit)
 
-        for stage in range(n_stages):
-            samples = rng.uniform(lo, hi, size=(n_per_stage, 3))
-            # evaluate misfit at every sample; lower is better
-            fvals = np.empty(n_per_stage, dtype=np.float64)
-            for i in range(n_per_stage):
-                fvals[i] = self.edt(samples[i])
-            k = int(np.argmin(fvals))
-            if fvals[k] < best_f:
-                best_f = fvals[k]
-                best_x = samples[k].copy()
-            # contract the box around the current best for the next stage
-            half = 0.5 * (hi - lo) * contract
-            lo = np.maximum(best_x - half, np.asarray(min_coords[:3]))
-            hi = np.minimum(best_x + half, np.asarray(max_coords[:3]))
+        for stage in range(max_stages):
+            U = _sobol.sobol(n_per_stage, 3, seed=int(rng.integers(1 << 30)))
+            S = np.ascontiguousarray(lo + U * (hi - lo))
+            f = -self.edt_many(S)[0]
+            f[~np.isfinite(f)] = 1e6
+            # every sample so far that is still inside the current box
+            X = np.concatenate([X, S])
+            F = np.concatenate([F, f])
+            elite = np.argsort(F, kind="stable")[:n_elite]
+            e_lo, e_hi = X[elite].min(axis=0), X[elite].max(axis=0)
+            margin = pad * (e_hi - e_lo)
+            lo = np.maximum(e_lo - margin, lo0)
+            hi = np.minimum(e_hi + margin, hi0)
+            keep = np.all((X >= lo) & (X <= hi), axis=1)
+            X, F = X[keep], F[keep]
+            if np.all((hi - lo) * km < stop_km):
+                break
 
-        # local polish to sub-node precision around the sampled mode
+        k = int(np.argmin(F))
+        best_x, best_f = X[k].copy(), float(F[k])
+
+        # Local polish, in kilometres about the sampled mode. The grid's own
+        # coordinates mix km with radians, in which one step size or one
+        # tolerance cannot mean the same thing on every axis.
+        y_lo, y_hi = (lo0 - best_x) * km, (hi0 - best_x) * km
+        half = np.maximum(0.5 * (hi - lo) * km, 0.05)
+        simplex = np.zeros((4, 3))
+        for ax in range(3):
+            step = half[ax] if half[ax] <= y_hi[ax] else -half[ax]
+            simplex[ax + 1, ax] = min(max(step, y_lo[ax]), y_hi[ax])
+
+        def misfit_km(y):
+            return self.edt(np.ascontiguousarray(best_x + y / km))
+
         # NOTE we are using a local clone of the scipy.optimize nelder-mead to speed things up
         polished = _neldermead.minimize(
-            self.edt, best_x,
+            misfit_km, np.zeros(3),
             method='Nelder-Mead',
-            bounds=_neldermead.Bounds(
-                np.asarray(min_coords[:3], dtype=np.float64),
-                np.asarray(max_coords[:3], dtype=np.float64)),            
-            options={'xatol': 0.05, 'fatol': 1e-4, 'maxiter': 200},
+            bounds=_neldermead.Bounds(y_lo, y_hi),
+            options={'xatol': 0.01, 'fatol': 1e-4, 'maxiter': 200,
+                     'initial_simplex': simplex},
         )
-        hypo = polished.x if polished.fun < best_f else best_x
-        hypo = np.asarray(hypo, dtype=np.float64)
+        if polished.fun < best_f:
+            hypo = np.clip(best_x + np.asarray(polished.x) / km, lo0, hi0)
+        else:
+            hypo = best_x
+        hypo = np.ascontiguousarray(hypo, dtype=np.float64)
 
         t0 = self.origin_time(hypo)
 
@@ -1136,13 +1169,6 @@ cdef class EQLocator(object):
         # with no near-source station -- the likelihood is monotone along
         # it, so the mode runs to the boundary of the search volume and
         # stops there. A centred stencil then steps off the grid.
-        #
-        # Previously ANY such step made the Hessian non-finite and this
-        # routine returned None, dropping the sampler into the uniform
-        # fallback. That is what produced fallback rates of 50-80%, and it
-        # happened precisely on the geometries where a good proposal
-        # matters most. The stencil now goes one-sided on the offending
-        # axis instead of discarding all three.
         edge = np.zeros(3, dtype=bool)
 
         for i in range(3):
@@ -1211,7 +1237,8 @@ cdef class EQLocator(object):
     def sample_posterior(self, hypocenter, delta, nsamples=4096, nscatter=1024,
                          seed=None, exponent=None, proposal="qmc",
                          inflate=3.0, rounds=2, center="solution",
-                         search_delta=None, include_time=True):
+                         search_delta=None, include_time=True,
+                         ess_target=None, max_nsamples=65536):
         """
         NLL-style posterior characterization around a solution: importance
         sampling of the EDT likelihood over hypocenter +/- delta (3-vectors
@@ -1282,7 +1309,17 @@ cdef class EQLocator(object):
           sigma_rel_mcse: Monte Carlo standard error on the reported sigma,
                           as a fraction of sigma (~1/sqrt(2*ESS))
           ess           : effective sample size of the importance weights
+          nsamples      : how many points were drawn (more than the
+                          `nsamples` argument when ess_target grew the set)
           proposal      : which proposal was actually used
+
+        ess_target (qmc proposal only): instead of drawing a fixed number
+        of points, treat `nsamples` as the first draw and keep doubling the
+        Sobol set until the effective sample size reaches ess_target or
+        max_nsamples points have been drawn. The points already evaluated
+        are kept. This replaces choosing nsamples by hand: the relative
+        Monte Carlo error on sigma is about 1/sqrt(2*ESS), so a target of
+        200 means roughly 5% whatever the event's geometry.
 
         The raw EDT stack is a broad, heavy-tailed surface; following NLL's
         EDT^N sharpening, the posterior is taken proportional to
@@ -1346,19 +1383,22 @@ cdef class EQLocator(object):
                         saved_floor, float(np.sum(r * r) / (nf - 4)))
             return self._sample_posterior(
                 hypocenter, delta, nsamples, nscatter, seed, exponent,
-                proposal, inflate, rounds, center, search_delta, include_time)
+                proposal, inflate, rounds, center, search_delta, include_time,
+                ess_target, max_nsamples)
         finally:
             self.cy_variance_floor = saved_floor
 
 
     def _qmc_samples(self, hypocenter, delta, delta_km, s, scale, nsamples,
-                     seed, inflate, eps=0.3, df=4.0):
+                     seed, inflate, eps=0.3, df=4.0, ess_target=None,
+                     max_nsamples=65536):
         """
         Randomised QMC draws from a defensive mixture proposal.
 
-        Returns (samples [grid coords], logw, label), or (None, None, label)
-        when too few draws have a finite likelihood, in which case the caller
-        falls back to the uniform proposal.
+        Returns (samples [grid coords], logw, label, n_drawn), or
+        (None, None, label, n_drawn) when too few draws have a finite
+        likelihood, in which case the caller falls back to the uniform
+        proposal.
 
         Dimensions of each 5-D Sobol point: 0-2 give either three standard
         normals (by inverse CDF) or a uniform offset in the box; 3 gives the
@@ -1366,9 +1406,19 @@ cdef class EQLocator(object):
         the mixture component. All in the local km frame; the grid<->km
         Jacobian is constant over the box and cancels in the self-normalised
         weights.
+
+        With ess_target set, nsamples is only the first draw: while the
+        effective sample size of the weights is below the target the point
+        set is doubled, up to max_nsamples. A scrambled Sobol sequence is
+        extensible -- the first n points of 2n are the n already drawn, for
+        one scramble -- so nothing is evaluated twice and the enlarged set
+        is still a balanced net. That needs one scramble for the whole
+        call, so an unset seed is drawn once here rather than per block.
         """
         n_pts = 1 << max(int(np.ceil(np.log2(max(int(nsamples), 16)))), 4)
-        U = _sobol.sobol(n_pts, 5, seed=seed)
+        n_max = max(n_pts, 1 << int(np.floor(np.log2(max(int(max_nsamples), 16)))))
+        if seed is None:
+            seed = int(np.random.SeedSequence().generate_state(1)[0])
 
         label = "qmc"
         L = None
@@ -1383,44 +1433,70 @@ cdef class EQLocator(object):
             eps = 1.0
             label = "qmc (uniform only: no usable Hessian)"
 
-        y = (2.0 * U[:, :3] - 1.0) * delta_km               # uniform component
-        if L is not None:
-            z = _sobol.norm_ppf(np.clip(U[:, :3], 1e-15, 1.0 - 1e-15))
-            g = _sobol.chi2_4_ppf(np.clip(U[:, 3], 1e-15, 1.0 - 1e-9)) / df
-            y_t = (z / np.sqrt(g)[:, None]) @ L.T
-            y = np.where((U[:, 4] >= eps)[:, None], y_t, y)
-
-        # Draws outside the box are discarded. The mixture density below is
-        # the density of the KEPT draws up to one shared constant (the t is
-        # normalised over all space, the uniform over the box), so it is the
-        # right divisor for self-normalised weights.
-        y = y[np.all(np.abs(y) <= delta_km, axis=1)]
-        cand = hypocenter + y / s
-        logl = np.array([scale * self.edt_log_likelihood(c_i) for c_i in cand])
-
         log_u = -float(np.sum(np.log(2.0 * delta_km)))
         if L is not None:
-            quad = np.sum(y * np.linalg.solve(cov, y.T).T, axis=1)
-            log_t = (_math.lgamma(0.5 * (df + 3.0)) - _math.lgamma(0.5 * df)
-                     - 1.5 * _math.log(df * _math.pi)
-                     - float(np.sum(np.log(np.diag(L))))
-                     - 0.5 * (df + 3.0) * np.log1p(quad / df))
-            logq = np.logaddexp(_math.log(1.0 - eps) + log_t,
-                                _math.log(eps) + log_u)
-        else:
-            logq = np.full(len(y), log_u)
+            log_t0 = (_math.lgamma(0.5 * (df + 3.0)) - _math.lgamma(0.5 * df)
+                      - 1.5 * _math.log(df * _math.pi)
+                      - float(np.sum(np.log(np.diag(L)))))
 
-        logw = logl - logq
-        finite = np.isfinite(logw)
-        if int(finite.sum()) < 16:
-            return None, None, "uniform (qmc fallback)"
-        return cand[finite], logw[finite], label
+        cands, logws, ots = [], [], []
+        done = 0
+        while True:
+            U = _sobol.sobol(n_pts, 5, seed=seed)[done:]
+            done = n_pts
+
+            y = (2.0 * U[:, :3] - 1.0) * delta_km           # uniform component
+            if L is not None:
+                z = _sobol.norm_ppf(np.clip(U[:, :3], 1e-15, 1.0 - 1e-15))
+                g = _sobol.chi2_4_ppf(np.clip(U[:, 3], 1e-15, 1.0 - 1e-9)) / df
+                y_t = (z / np.sqrt(g)[:, None]) @ L.T
+                y = np.where((U[:, 4] >= eps)[:, None], y_t, y)
+
+            # Draws outside the box are discarded. The mixture density below
+            # is the density of the KEPT draws up to one shared constant (the
+            # t is normalised over all space, the uniform over the box), so
+            # it is the right divisor for self-normalised weights.
+            y = y[np.all(np.abs(y) <= delta_km, axis=1)]
+            cand = np.ascontiguousarray(hypocenter + y / s)
+            logl, ot = self.edt_many(cand)
+            logl = scale * logl
+
+            if L is not None:
+                quad = np.sum(y * np.linalg.solve(cov, y.T).T, axis=1)
+                log_t = log_t0 - 0.5 * (df + 3.0) * np.log1p(quad / df)
+                logq = np.logaddexp(_math.log(1.0 - eps) + log_t,
+                                    _math.log(eps) + log_u)
+            else:
+                logq = np.full(len(y), log_u)
+
+            logw = logl - logq
+            finite = np.isfinite(logw)
+            cands.append(cand[finite])
+            logws.append(logw[finite])
+            ots.append(ot[finite])
+
+            if ess_target is None or n_pts >= n_max:
+                break
+            lw = np.concatenate(logws)
+            if len(lw) >= 16:
+                w = np.exp(lw - lw.max())
+                if (w.sum() ** 2) / np.sum(w * w) >= ess_target:
+                    break
+            n_pts *= 2
+
+        cand = np.concatenate(cands)
+        logw = np.concatenate(logws)
+        if len(logw) < 16:
+            return None, None, "uniform (qmc fallback)", done
+        self.cy_last_t0s = np.concatenate(ots)
+        return cand, logw, label, done
 
 
     def _sample_posterior(self, hypocenter, delta, nsamples=4096, nscatter=1024,
                          seed=None, exponent=None, proposal="qmc",
                          inflate=3.0, rounds=2, center="solution",
-                         search_delta=None, include_time=True):
+                         search_delta=None, include_time=True,
+                         ess_target=None, max_nsamples=65536):
 
         rng = np.random.default_rng(seed)
         hypocenter = np.asarray(hypocenter, dtype=np.float64)[:3]
@@ -1453,10 +1529,15 @@ cdef class EQLocator(object):
 
         samples = None
         used = proposal
+        n_drawn = int(nsamples)
+        self.cy_last_t0s = None
 
         if proposal == "qmc":
-            samples, logw, used = self._qmc_samples(
-                hypocenter, delta, delta_km, s, scale, nsamples, seed, inflate)
+            samples, logw, used, n_drawn = self._qmc_samples(
+                hypocenter, delta, delta_km, s, scale, nsamples, seed, inflate,
+                ess_target=ess_target, max_nsamples=max_nsamples)
+            if samples is None:
+                n_drawn = int(nsamples)      # the uniform fallback below
 
         elif proposal == "hessian":
             cov = self._edt_proposal_cov(hypocenter, scale, delta)   # km^2
@@ -1637,11 +1718,14 @@ cdef class EQLocator(object):
         cov4 = None
         depth_time_corr = np.nan
         if include_time:
-            t0s = np.empty(len(samples), dtype=np.float64)
-            for _i in range(len(samples)):
-                t0s[_i] = self.origin_time(
-                    np.ascontiguousarray(samples[_i], dtype=np.float64)
-                )
+            if used.startswith("qmc") and self.cy_edt_ot_wt and self.cy_last_t0s is not None:
+                t0s = np.asarray(self.cy_last_t0s)
+            else:
+                t0s = np.empty(len(samples), dtype=np.float64)
+                for _i in range(len(samples)):
+                    t0s[_i] = self.origin_time(
+                        np.ascontiguousarray(samples[_i], dtype=np.float64)
+                    )
             _finite = np.isfinite(t0s)
             if _finite.sum() >= 4:
                 t0_solution = self.origin_time(
@@ -1700,6 +1784,7 @@ cdef class EQLocator(object):
             },
             "metric_scale": s,
             "ess": ess,
+            "nsamples": n_drawn,
             "proposal": used,
             "time": time_solution,
             "time_sigma": time_sigma,

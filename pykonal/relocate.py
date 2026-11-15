@@ -1,12 +1,6 @@
 """
 The relocation sequence shared by every pykonal driver.
 
-pykonal_locext (SeisComP) and pykonal_obspy (ObsPy) used to carry their own
-copies of this logic. Each fix then had to be made twice, and the copies
-drifted: the posterior read, solve_n_closest residuals and the depth-axis
-index each broke in one driver but not the other. This module is the single
-implementation. A driver now only
-
   * reads its input format into plain Python (arrivals, pick errors, station
     coordinates, a starting hypocentre, settings),
   * opens the traveltime inventory and an EQLocator (grid building and file
@@ -18,20 +12,22 @@ Sequence
 --------
  1. configure the locator (alpha, pick errors, EDT options, seed, stations)
  2. choose the solve set (solve_n_closest)
- 3. size the search box (sizing.size_auto_box / size_fixed_box)
- 4. locate
+ 3. size the search box (sizing.size_auto_box / size_fixed_box); depth
+    bounds the config leaves open default to the extent of the grids
+ 4. locate, once
  5. residuals for EVERY arrival, reading grids for those outside the solve set
  6. iterative outlier rejection, relocating on the solve set
  7. quality metrics
- 8. posterior (EDT only): read grids for the sampled volume, sample, widen
-    truncated horizontal axes in auto mode, interpret, diagnose
+ 8. posterior (EDT only): in auto mode size the box at the solution
+    (sizing.size_posterior_box), read grids for the sampled volume, sample
+    until the effective sample size is reached, widen truncated axes in
+    auto mode, interpret, diagnose
 
 Coordinates: spherical grids only, as produced by transformations.GeoTransform.
 Time: arrival times and the starting origin time must share one reference
 (epoch seconds, or seconds after the first pick). Relative times are better
 conditioned; the library copes with epochs.
 
-No ObsPy or SeisComP imports here.
 """
 import math
 import time as _time
@@ -44,7 +40,8 @@ from . import sizing
 
 __all__ = ["RelocationError", "Relocation", "DEFAULTS", "relocate",
            "FIRST_ARRIVAL_PHASES", "normalize_phase_map", "map_phase",
-           "low_ess_message", "ESS_MIN"]
+           "low_ess_message", "ESS_MIN", "ESS_TARGET",
+           "resolve_posterior_nsamples"]
 
 Key = Tuple[str, str, str]          # (network, station, phase)
 
@@ -67,7 +64,11 @@ DEFAULTS = {
     "outlier_cutoff_s": 3.0,
     "outlier_mad_factor": 4.0,
     "outlier_min_arrivals": 6,
-    "posterior_nsamples": 2048,
+    # "auto": draw until the effective sample size reaches ESS_TARGET
+    # (starting at NSAMPLES_AUTO_START, doubling, at most
+    # NSAMPLES_SUGGEST_MAX). An integer draws exactly that many; 0 skips
+    # the uncertainty estimate.
+    "posterior_nsamples": "auto",
     "posterior_rounds": 2,              # ignored by the default qmc proposal
     "posterior_seed": None,
     "log_search_detail": False,
@@ -77,13 +78,36 @@ DEFAULTS = {
 
 # Effective sample size below which the uncertainty estimate is flagged.
 ESS_MIN = 50
-# Target when suggesting a larger posterior_nsamples, and the largest value
-# suggested (beyond it, sampling costs several seconds per event).
+# Target effective sample size: what posterior_nsamples "auto" draws until
+# it reaches, and what a suggested larger fixed posterior_nsamples aims for.
+# At 200 the Monte Carlo error on a reported sigma is about 5%.
 ESS_TARGET = 200
+# First draw in "auto" mode, and the most "auto" will draw or a suggestion
+# will name (beyond it, sampling costs several seconds per event).
+NSAMPLES_AUTO_START = 1024
 NSAMPLES_SUGGEST_MAX = 65536
 
 
-def low_ess_message(ess, nsamples, mcse=None):
+def resolve_posterior_nsamples(value):
+    """
+    (nsamples, ess_target) for a posterior_nsamples setting.
+
+    "auto" or None -> (NSAMPLES_AUTO_START, ESS_TARGET): draw, check the
+    effective sample size, double until it is reached. An integer -> that
+    many samples and no target; 0 disables the uncertainty estimate.
+    """
+    if value is None or (isinstance(value, str)
+                         and value.strip().lower() == "auto"):
+        return NSAMPLES_AUTO_START, float(ESS_TARGET)
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"posterior_nsamples must be \"auto\" or an "
+                         f"integer, got {value!r}") from None
+    return max(n, 0), None
+
+
+def low_ess_message(ess, nsamples, mcse=None, auto=False):
     """
     Operator message for a poorly resolved uncertainty estimate.
 
@@ -94,6 +118,14 @@ def low_ess_message(ess, nsamples, mcse=None):
     to 8 km) and cuts off the posterior, so the only advice is more samples.
     """
     ess = max(float(ess), 1.0)
+    if auto:
+        # "auto" already drew up to its limit; there is nothing to raise.
+        spread = "" if mcse is None or not np.isfinite(mcse) else (
+            f" (sigma may vary by about {100 * float(mcse):.0f}% between "
+            f"runs)")
+        return (f"posterior: effective sample size {ess:.0f} after "
+                f"{int(nsamples)} samples, the most posterior_nsamples "
+                f"\"auto\" draws - uncertainties are poorly resolved{spread}")
     want = int(nsamples) * ESS_TARGET / ess
     suggest = min(1 << int(math.ceil(math.log2(max(want, 1.0)))),
                   NSAMPLES_SUGGEST_MAX)
@@ -363,15 +395,23 @@ def relocate(locator, transform, arrivals, pick_errors, stations, initial,
     _set_arrivals(locator, solve_arrivals, pick_errors)
 
     # ---- 3. search box
+    for key, why in sizing.removed_auto_keys(settings):
+        detail(f"{key} is no longer used ({why}); you can delete it from "
+               f"your config")
+    # A depth bound the config leaves open defaults to where the grids end.
+    # A pinned depth is its own bound, so nothing needs filling in.
+    if fixed_depth is None:
+        depth_min, depth_max, from_grid = sizing.grid_depth_bounds(
+            locator, transform, list(solve_arrivals), initial_grid[:3],
+            depth_min, depth_max)
+        if from_grid:
+            detail(f"depth search limited to the traveltime grids: "
+                   f"{depth_min:.1f} to {depth_max:.1f} km")
     if auto:
         box = sizing.size_auto_box(
             locator, transform, initial_grid, delta_t,
             arrival_keys=list(solve_arrivals), dep0_km=dep0, lat0=lat0,
-            lon0=lon0, cfg=settings, method=method, alpha=alpha,
-            default_pick_error=default_err, posterior_seed=seed,
-            station_distances_km={k[:2]: station_dist_km[k[:2]]
-                                  for k in solve_arrivals
-                                  if k[:2] in station_dist_km},
+            lon0=lon0, cfg=settings,
             fixed_depth=fixed_depth, fixed_depth_tolerance=tol_km,
             depth_min=depth_min, depth_max=depth_max, log=detail)
     else:
@@ -382,8 +422,10 @@ def relocate(locator, transform, arrivals, pick_errors, stations, initial,
             log=detail)
     if fixed_depth is not None:
         say(f"fixed depth {float(fixed_depth):.2f} km, search tolerance "
-            f"+/-{max(tol_km, 1e-3):.2f} km; posterior depth half-width "
-            f"{abs(float(box.posterior_delta[DEPTH_AXIS])):.1f} km")
+            f"+/-{max(tol_km, 1e-3):.2f} km"
+            + ("" if box.posterior_delta is None else
+               f"; posterior depth half-width "
+               f"{abs(float(box.posterior_delta[DEPTH_AXIS])):.1f} km"))
     say(sizing.describe_search_box(transform, initial_grid, box.delta_grid,
                                    box.bounds, auto, fixed_depth=fixed_depth,
                                    fixed_depth_tolerance_km=tol_km))
@@ -437,6 +479,21 @@ def relocate(locator, transform, arrivals, pick_errors, stations, initial,
             say(f"rejected {len(excluded)} outlier arrival(s) (cutoff "
                 f"{cut:.2f} s): " + ", ".join(".".join(k) for k in excluded))
 
+    # The search cannot leave its box. A solution resting against a
+    # horizontal face is the edge of the box, not a minimum: say so rather
+    # than report it as a location. (Depth is bounded by the grids or by the
+    # operator's limits, where stopping at the bound is legitimate.)
+    span = np.asarray(read_hi, dtype=float) - np.asarray(read_lo, dtype=float)
+    at_face = [name for ax, name in ((1, "north-south"), (2, "east-west"))
+               if span[ax] > 0 and min(soln[ax] - read_lo[ax],
+                                       read_hi[ax] - soln[ax]) < 0.01 * span[ax]]
+    if at_face:
+        say(f"the solution lies on the {' and '.join(at_face)} edge of the "
+            f"search box, so the event is probably outside it: "
+            + ("raise auto_search_max_km" if auto else
+               "use a larger search_delta_km")
+            + " or start from a closer origin.", "warning")
+
     uncovered = sorted(set(arrivals) - set(residuals) - set(no_grid))
     if uncovered:
         say(f"{len(uncovered)} arrival(s) have no traveltime at the solution "
@@ -457,18 +514,40 @@ def relocate(locator, transform, arrivals, pick_errors, stations, initial,
         depth_pinned=box.depth_pinned, outlier_cutoff_s=cut, messages=messages)
 
     # ---- 8. posterior
-    nsamples = int(_setting(settings, "posterior_nsamples"))
+    try:
+        nsamples, ess_target = resolve_posterior_nsamples(
+            settings.get("posterior_nsamples", DEFAULTS["posterior_nsamples"]))
+    except ValueError as err:
+        raise RelocationError(str(err)) from None
     if posterior and method == "edt" and nsamples > 0:
         _posterior(result, locator, transform, settings, auto, seed, nsamples,
-                   say, detail, depth_advice)
+                   ess_target, say, detail, depth_advice)
     result.compute_seconds = _time.time() - t_compute
     return result
 
 
 def _posterior(result, locator, transform, settings, auto, seed, nsamples,
-               say, detail, depth_advice=""):
+               ess_target, say, detail, depth_advice=""):
     soln, box = result.hypocenter, result.box
     rounds = int(_setting(settings, "posterior_rounds"))
+    if auto:
+        # Sized at the solution from the linearised covariance of the grids
+        # locate() left in memory (the solve set, over the searched volume).
+        mind = result.quality.get("min_station_dist", float("nan"))
+        try:
+            delta, pinfo = sizing.size_posterior_box(
+                locator, transform, soln[:3], cfg=settings,
+                min_station_dist_km=(float(mind) if np.isfinite(mind)
+                                     else None),
+                log=detail)
+        except Exception as exc:               # never lose a location
+            delta = sizing.cap_delta_grid(transform, soln[:3], settings)
+            pinfo = {"sigma_km": None}
+            detail(f"uncertainty box: sizing failed ({exc}); sampling the "
+                   f"whole searched box")
+        box.posterior_delta = np.array(delta, dtype=float)
+        box.sigma_km = pinfo.get("sigma_km")
+        box.info.update(posterior_box=pinfo)
     delta = np.abs(np.asarray(box.posterior_delta, dtype=float)).copy()
 
     def sample(half, widened=False):
@@ -480,14 +559,18 @@ def _posterior(result, locator, transform, settings, auto, seed, nsamples,
         # box_fill (informational) is measured against the search box
         # horizontally and the sampled extent in depth, since the location
         # box may be pinned; after widening, against the widened box.
-        if widened:
+        if widened or auto:
+            # auto: the box sampled IS the reference; the location search
+            # box is the whole of auto_search_max_km and says nothing here
             search_hw = np.array(half, dtype=float)
         else:
             search_hw = np.abs(np.asarray(box.delta_grid, dtype=float)).copy()
             search_hw[DEPTH_AXIS] = half[DEPTH_AXIS]
         return locator.sample_posterior(soln[:3], half, nsamples=nsamples,
                                         nscatter=0, seed=seed, rounds=rounds,
-                                        search_delta=search_hw)
+                                        search_delta=search_hw,
+                                        ess_target=ess_target,
+                                        max_nsamples=NSAMPLES_SUGGEST_MAX)
 
     try:
         post = sample(delta)
@@ -495,13 +578,16 @@ def _posterior(result, locator, transform, settings, auto, seed, nsamples,
         say(f"posterior sampling failed: {exc}", "error")
         return
 
-    # "auto" settles the box without operator input: a horizontal axis the
-    # posterior still runs into is widened (up to auto_search_max_km) and
-    # sampled again. Depth is never widened.
+    # "auto" settles the box without operator input: an axis the posterior
+    # still runs into is widened (up to auto_search_max_km) and sampled
+    # again. Depth is included: its starting width is a linearised estimate
+    # that can be too small, so it only counts as unconstrained once it is
+    # still truncated at the cap.
     if auto:
         cap = sizing.cap_delta_grid(transform, soln[:3], settings)
         for _pass in range(3):
-            new_d, widened, _capped = sizing.widen_truncated_axes(post, delta, cap)
+            new_d, widened, _capped = sizing.widen_truncated_axes(
+                post, delta, cap, widen_depth=True)
             if new_d is None:
                 break
             try:
@@ -542,7 +628,7 @@ def _posterior(result, locator, transform, settings, auto, seed, nsamples,
         say(f"posterior: curvature-based proposal unusable, fell back to "
             f"{prop}; uncertainties are less reliable")
     if low_ess:
-        say(low_ess_message(ess, nsamples, mcse))
+        say(low_ess_message(ess, int(post.get("nsamples", nsamples)), mcse,
+                            auto=ess_target is not None))
 
     result.posterior, result.posterior_delta, result.limits = post, delta, limits
-

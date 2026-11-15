@@ -70,7 +70,7 @@ CONFIG_DEFAULTS = {
     "depth_max": None,
     "default_depth": None,
     "min_picks": 4,
-    "posterior_nsamples": 4096,
+    "posterior_nsamples": "auto",     # or an integer; 0 = no uncertainties
     "posterior_seed": None,
     "confidence_level": 68.0,
     "stations_csv": None,
@@ -151,7 +151,15 @@ def load_config(config):
                if k not in CONFIG_DEFAULTS and k not in CONFIG_UNSUPPORTED
                and k not in CONFIG_QUIET and k not in quiet
                and not k.startswith(_AUTO_PREFIX)]
-    bad_auto = [k for k in auto if k not in sizing.AUTO_DEFAULTS]
+    removed = [k for k, _why in sizing.removed_auto_keys(cfg)
+               if k not in quiet]
+    if removed:
+        warnings.warn(
+            "config keys no longer used (single-pass sizing): "
+            + "; ".join(f"{k} ({sizing.AUTO_REMOVED[k]})" for k in removed)
+            + ". Delete them, or list them in suppress_warnings.")
+    bad_auto = [k for k in auto if k not in sizing.AUTO_DEFAULTS
+                and k not in sizing.AUTO_REMOVED]
     if bad_auto:
         warnings.warn(f"unrecognised auto_search_* keys ignored: "
                       f"{', '.join(sorted(bad_auto))}")

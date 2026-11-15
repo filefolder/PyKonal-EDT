@@ -32,6 +32,8 @@ cdef class EQLocator(object):
     cdef constants.REAL_t[:]     cy_tt_work
     cdef constants.REAL_t[:]     cy_ot_work
     cdef object                  cy_edge_axes
+    cdef constants.REAL_t        cy_last_ot
+    cdef object                  cy_last_t0s
     # traveltime read cache (see read_traveltimes)
     cdef object                  cy_tt_box_min
     cdef object                  cy_tt_box_max
