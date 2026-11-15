@@ -204,7 +204,7 @@ def test_ensure_skips_phase_without_model(ab_inventory, vp):
     assert rep["skipped"] == [("XX", "A", "S")]
 
 
-def test_concurrent_ensure_computes_once(ab_inventory, vp):
+def test_concurrent_ensure_computes_once(tmp_path, ab_inventory, vp):
     worker = textwrap.dedent(f"""
         import numpy as np
         from pykonal.inventory import ensure_traveltimes
@@ -216,8 +216,11 @@ def test_concurrent_ensure_computes_once(ab_inventory, vp):
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(
         [os.path.dirname(os.path.dirname(pykonal.__file__))]
         + os.environ.get("PYTHONPATH", "").split(os.pathsep)))
+    # cwd=tmp_path: `python -c` puts the working directory first on sys.path,
+    # so started from a source checkout the workers would import its unbuilt
+    # pykonal instead of the one this test process is using
     procs = [subprocess.Popen([sys.executable, "-c", worker], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, env=env)
+                              stderr=subprocess.PIPE, text=True, env=env, cwd=str(tmp_path))
              for _ in range(2)]
     outs = [p.communicate(timeout=120) for p in procs]
     assert all(p.returncode == 0 for p in procs), [o[1][-500:] for o in outs]

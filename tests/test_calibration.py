@@ -82,8 +82,13 @@ def test_uncertainty_is_conservative_but_informative(results):
 
 # ------------------------------------------------------------------- slow
 def _run(script, *args, cwd, env=None):
+    # Put the pykonal this test session imported first on the path. Not the
+    # repository root: with a regular (non-editable) install that holds an
+    # unbuilt source copy, and the scripts would fail to import it.
+    import pykonal
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(pykonal.__file__)))
     e = dict(os.environ, PYTHONPATH=os.pathsep.join(
-        [REPO] + os.environ.get("PYTHONPATH", "").split(os.pathsep)), **(env or {}))
+        [pkg_parent] + os.environ.get("PYTHONPATH", "").split(os.pathsep)), **(env or {}))
     return subprocess.run([sys.executable, os.path.join(REPO, "validation", script), *args],
                           capture_output=True, text=True, env=e, cwd=str(cwd),
                           timeout=1800)
